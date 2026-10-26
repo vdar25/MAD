@@ -324,7 +324,9 @@ docker run --rm --device /dev/dri --device /dev/kfd --device /dev/infiniband \
 ```
 
 Add `--ibdevice <device>` or `-e IBDEVICE -e GLOO_SOCKET_IFNAME` to pin the
-network settings instead of detecting them.
+network settings instead of detecting them. The Slurm launcher mounts `/sys`
+read-write, and retries that mount read-only when the docker daemon requires
+it. Detection only reads sysfs, so either mount works.
 
 
 

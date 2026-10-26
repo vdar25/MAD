@@ -69,7 +69,22 @@ if [ -z "${SLURM_NODELIST:-}" ] && [ -n "${SLURM_JOB_ID:-}" ]; then
     SLURM_NODELIST=$(scontrol show job "$SLURM_JOB_ID" 2>/dev/null | grep -oP '(?<!\w)NodeList=\K\S+' | grep -v '(null)' | head -1)
     echo "INFO: Recovered SLURM_NODELIST='$SLURM_NODELIST' from SLURM_JOB_ID=$SLURM_JOB_ID"
 fi
-NODES=($(scontrol show hostname "${SLURM_NODELIST:-}" 2>/dev/null))
+# Expand a hostlist without assuming one scontrol spelling. `hostnames` and
+# `hostname` are aliases on stock Slurm; a given build may have only one.
+# An already-expanded comma list needs neither.
+NODES=()
+_expanded=
+for _scontrol_cmd in hostnames hostname; do
+    if _expanded=$(scontrol show "$_scontrol_cmd" "${SLURM_NODELIST:-}" 2>/dev/null) && [ -n "$_expanded" ]; then
+        break
+    fi
+    _expanded=
+done
+if [ -n "$_expanded" ]; then
+    NODES=($_expanded)
+else
+    NODES=($(tr ',' ' ' <<<"${SLURM_NODELIST:-}"))
+fi
 if [ ${#NODES[@]} -lt 2 ]; then
     echo "ERROR: Need 2 nodes (target, initiator), got ${#NODES[@]}: '${NODES[*]:-}'. SLURM_NODELIST='${SLURM_NODELIST:-}' SLURM_JOB_ID='${SLURM_JOB_ID:-}'"
     exit 1
@@ -108,6 +123,22 @@ LOCAL_IP=$(hostname -I | awk '"'"'{print $1}'"'"')
 GPUS_PER_NODE=${SLURM_GPUS_PER_NODE##*:}
 [ -n "$GPUS_PER_NODE" ] || GPUS_PER_NODE=$(ls -d /dev/dri/renderD* 2>/dev/null | wc -l)
 
+# Default to a writable /sys. Some docker authz policies reject that and
+# require the mount to be read-only; detection only reads sysfs, so either works.
+SYS_VOL=/sys:/sys
+_sys_probe=$(mktemp)
+if ! docker run --rm --network host --entrypoint /bin/true -v /sys:/sys '"$DOCKER_IMAGE"' >"$_sys_probe" 2>&1; then
+    if grep -qi "read-only" "$_sys_probe"; then
+        echo "INFO: docker requires /sys mounted read-only on $(hostname)"
+        SYS_VOL=/sys:/sys:ro
+    else
+        cat "$_sys_probe" >&2
+        rm -f "$_sys_probe"
+        exit 1
+    fi
+fi
+rm -f "$_sys_probe"
+
 docker run --rm \
     --device /dev/dri \
     --device /dev/kfd \
@@ -122,7 +153,7 @@ docker run --rm \
     --security-opt seccomp=unconfined \
     --ulimit memlock=-1:-1 \
     -v "$HOME:$HOME" \
-    -v /sys:/sys \
+    -v "$SYS_VOL" \
     -v "$HOME/.ssh:/root/.ssh" \
     -v '"$KV_CACHE_TEST_REPO"':'"$KV_CACHE_TEST_PATH"' \
     --shm-size 64G \
@@ -135,6 +166,7 @@ docker run --rm \
     -e MAD_SYSTEM_GPU_ARCHITECTURE='"${MAD_SYSTEM_GPU_ARCHITECTURE:-}"' \
     -e IBDEVICES \
     -e GLOO_SOCKET_IFNAME \
+    ${MORI_ROOT:+-e MORI_ROOT} \
     --name '"$DOCKER_CONTAINER_NAME"' \
     '"$DOCKER_IMAGE"' /bin/bash -c "'"$DRIVER_SCRIPT"' --node1 '"${NODE1}"' --node2 '"${NODE2}"' --kv-cache-test-path '"$KV_CACHE_TEST_PATH"' --shared-folder '"$KV_CACHE_TEST_PATH"' --backends '"${BENCH_BACKENDS:-all}"' --start-size '"$START_SIZE"' --stop-size '"$STOP_SIZE"' --sync-port '"$SYNC_PORT"' --model-name '"$BENCH_MODEL_NAME"'"
 '

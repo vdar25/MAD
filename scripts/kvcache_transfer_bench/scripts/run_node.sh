@@ -111,6 +111,7 @@ mkdir -p "$SHARED_FOLDER"
 CURRENT_HOST=$(hostname)
 echo "CURRENT_HOST: $CURRENT_HOST"
 
+FAIL=0
 for backend in $BENCH_BACKENDS; do
     echo "=== Starting backend: $backend on $(hostname) (NODE1=$NODE1 CURRENT_HOST=$CURRENT_HOST) ==="
     if [ "$NODE1" = "$CURRENT_HOST" ]; then
@@ -132,7 +133,9 @@ for backend in $BENCH_BACKENDS; do
             --end_size $STOP_SIZE \
             --sync-port "$SYNC_PORT" 2>&1
     fi
-    echo "=== Backend $backend finished with exit code $? ==="
+    rc=$?
+    echo "=== Backend $backend finished with exit code $rc ==="
+    [ "$rc" -eq 0 ] || FAIL=1
 done
 
 # Merge results and generate report (run only on the initiator node)
@@ -165,4 +168,6 @@ if [ "$NODE1" != "$CURRENT_HOST" ]; then
         done
     fi
 fi
+
+exit "$FAIL"
 
