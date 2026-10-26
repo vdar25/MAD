@@ -6,12 +6,12 @@ Usage: net_detect.py rdma-device [CANDIDATES] | socket-ifname
 """
 
 import os
-import re
 import sys
 from pathlib import Path
 
 SYS_IB = Path("/sys/class/infiniband")
 KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+PCI_DEVICES = Path("/sys/bus/pci/devices")
 
 
 def _read(path: Path) -> str:
@@ -19,10 +19,6 @@ def _read(path: Path) -> str:
         return path.read_text().strip()
     except OSError:
         return ""
-
-
-def _natural(name: str) -> list:
-    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
 
 
 def socket_ifname() -> str:
@@ -34,44 +30,78 @@ def socket_ifname() -> str:
     return ""
 
 
-def _gpu0_pci_path() -> str:
-    """sysfs PCI path of HIP device 0; KFD lists GPU nodes in HIP order."""
+def _gpu_pci_paths() -> list:
+    """sysfs PCI paths of the GPUs in HIP device order, which is KFD's node order."""
     try:
         nodes = sorted((p for p in KFD_NODES.iterdir() if p.name.isdigit()), key=lambda p: int(p.name))
     except OSError:
-        return ""
+        return []
+    paths = []
     for node in nodes:
         props = dict(line.split()[:2] for line in _read(node / "properties").splitlines() if len(line.split()) > 1)
         if int(props.get("simd_count", 0)) == 0:
             continue
         loc, domain = int(props.get("location_id", 0)), int(props.get("domain", 0))
         bdf = f"{domain:04x}:{loc >> 8:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7:x}"
-        return os.path.realpath(f"/sys/bus/pci/devices/{bdf}")
-    return ""
+        paths.append(os.path.realpath(PCI_DEVICES / bdf))
+    return paths
 
 
-def _shared_depth(a: str, b: str) -> int:
-    depth = 0
-    for x, y in zip(a.split("/"), b.split("/")):
+def _numa(pci_path: str) -> int:
+    try:
+        return int(_read(Path(pci_path) / "numa_node"))
+    except ValueError:
+        return -1
+
+
+def _active_gbps(dev: str) -> int:
+    """Summed rate of the ACTIVE ports (MoRI-IO's RdmaDevice::TotalActiveGbps)."""
+    total = 0
+    for port in (SYS_IB / dev / "ports").glob("*"):
+        rate = _read(port / "rate").split()
+        if _read(port / "state").endswith("ACTIVE") and rate:
+            try:
+                total += int(float(rate[0]))
+            except ValueError:
+                pass
+    return total
+
+
+def _pci_hops(a: str, b: str) -> int:
+    """PCIe nodes strictly between two sysfs device paths, as MoRI-IO's TopoPathPci::Hops.
+
+    Root complexes meet at a virtual root, so devices under different ones are
+    connected through it.
+    """
+    pa, pb = a.split("/"), b.split("/")
+    shared = 0
+    for x, y in zip(pa, pb):
         if x != y:
             break
-        depth += 1
-    return depth
+        shared += 1
+    return len(pa) + len(pb) - 2 * shared - 1
+
+
+def _mori_rank(dev: str, gpu: str) -> tuple:
+    """Sort key of MoRI-IO's TopoSystem::MatchGpuAndNic: speed, NUMA, PCIe hops, name."""
+    nic = os.path.realpath(SYS_IB / dev / "device")
+    return (-_active_gbps(dev), _numa(nic) != _numa(gpu), _pci_hops(gpu, nic), dev)
 
 
 def rdma_device(candidates: str = "") -> str:
-    """The active RDMA device sharing the most PCIe ancestors with GPU 0.
+    """The RDMA device MoRI-IO would assign to GPU 0, which every backend allocates on.
 
-    Every backend allocates on GPU 0, and this is the NIC MoRI-IO would pick for it.
-    ``candidates`` (comma-separated) narrows the choice, and a single name is returned
-    as given. The device behind the default-route interface is the frontend NIC and is
-    skipped, as are bonds while any other device qualifies.
+    Like MoRI-IO, prefer the fastest active link, then a NIC on the GPU's NUMA node,
+    then the fewest PCIe hops, then the name. Unlike it, skip devices with no active
+    port, the device behind the default-route interface (the frontend NIC), and bonds
+    while any other device qualifies. ``candidates`` (comma-separated) narrows the
+    choice, and a single name is returned as given.
     """
     names = [c.strip() for c in candidates.split(",") if c.strip()]
     if len(names) == 1:
         return names[0]
     try:
-        devices = sorted((p.name for p in SYS_IB.iterdir()), key=_natural)
+        devices = sorted(p.name for p in SYS_IB.iterdir())
     except OSError:
         return ""
     if names:
@@ -90,10 +120,10 @@ def rdma_device(candidates: str = "") -> str:
     found = [d for d in found if "bond" not in d] or found
     if not found:
         return ""
-    gpu = _gpu0_pci_path()
-    if not gpu:
-        return found[0]
-    return max(found, key=lambda d: _shared_depth(gpu, os.path.realpath(SYS_IB / d / "device")))
+    gpus = _gpu_pci_paths()
+    if not gpus:
+        return min(found, key=lambda d: (-_active_gbps(d), d))
+    return min(found, key=lambda d: _mori_rank(d, gpus[0]))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ This benchmark measures KV cache transfer throughput across multiple backends (N
 
 - **Backends**: NIXL, Mori, Mooncake (ROCm KV transfer engines). NIXL replaces the deprecated ROCm/RIXL (same Python API); results from runs before the switch are labelled `rixl`.
 - **MoRI has two backends**: `mori` drives MoRI's Python benchmark (`tests/python/io/benchmark.py`, one `torchrun` per size), and `mori_cpp` drives MoRI-IO's C++ benchmark (`tests/cpp/io/bench_engine`, one process for the whole sweep). Both get the same flags from `backends/common/mori_settings.py`: RDMA write from GPU memory, batch size 1 with `--batch-contiguous`, the session fast path, 1 QP per transfer, 1 worker thread, and 500 timed iterations per size after 50 warmup, with the buffer sized to the sweep maximum. The Python benchmark has no warmup option, so `backends/mori/run_benchmark.py` adds it. The benchmarks still time differently: Python averages per-transfer times (submit, then a blocking `Wait()`), while C++ times the whole loop and spin-polls for completion.
-- **Environment**: 2 nodes, Docker containers, RDMA NICs (each node uses the one closest to GPU 0 unless told otherwise; see [Cluster-specific settings](#cluster-specific-settings))
+- **Environment**: 2 nodes, Docker containers, RDMA NICs (each node uses the one MoRI-IO would pick for GPU 0 unless told otherwise; see [Cluster-specific settings](#cluster-specific-settings))
 - **What it produces**: A sweep from `--start-size` through `--stop-size`, with JSON per backend, a merged CSV, and an interactive HTML report that compares backends across transfer sizes
 
 
@@ -122,7 +122,7 @@ resolves its network settings when it starts, and logs the result as
 
 | Variable                     | Default when unset                                                                  | Used by |
 | ---------------------------- | ----------------------------------------------------------------------------------- | ------- |
-| `IBDEVICE` (or `IBDEVICES`)  | The active RDMA device closest to GPU 0 in the PCIe tree, skipping the NIC that carries the default route and any bond | All four backends: NIXL through `UCX_NET_DEVICES`, Mooncake directly, and both MoRI backends through `MORI_RDMA_DEVICES` |
+| `IBDEVICE` (or `IBDEVICES`)  | The NIC MoRI-IO would assign to GPU 0: fastest active link, then on GPU 0's NUMA node, then fewest PCIe hops, then name. The NIC that carries the default route and any bond are skipped | All four backends: NIXL through `UCX_NET_DEVICES`, Mooncake directly, and both MoRI backends through `MORI_RDMA_DEVICES` |
 | `GLOO_SOCKET_IFNAME`         | The interface carrying the default route                                            | MoRI's bootstrap sockets |
 
 A single device name is used as given. A comma-separated list (for example a
