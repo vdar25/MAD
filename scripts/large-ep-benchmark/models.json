@@ -17,7 +17,8 @@
         ],
         "timeout": -1,
         "distributed": {
-            "launcher": "slurm_multi"
+            "launcher": "slurm_multi",
+            "nnodes": 1
         },
         "slurm": {
             "nodes": 1,
@@ -26,7 +27,6 @@
         },
         "env_vars": {
             "DOCKER_IMAGE_NAME": "<supply-your-image>",
-            "IBDEVICES": "mlx5_0",
             "SKIP_DEEPEP": "1"
         },
         "args": ""
@@ -49,7 +49,8 @@
         ],
         "timeout": -1,
         "distributed": {
-            "launcher": "slurm_multi"
+            "launcher": "slurm_multi",
+            "nnodes": 2
         },
         "slurm": {
             "nodes": 2,
@@ -58,7 +59,6 @@
         },
         "env_vars": {
             "DOCKER_IMAGE_NAME": "<supply-your-image>",
-            "IBDEVICES": "mlx5_0",
             "SKIP_DEEPEP": "1"
         },
         "args": ""
@@ -81,7 +81,8 @@
         ],
         "timeout": -1,
         "distributed": {
-            "launcher": "slurm_multi"
+            "launcher": "slurm_multi",
+            "nnodes": 4
         },
         "slurm": {
             "nodes": 4,
@@ -90,7 +91,6 @@
         },
         "env_vars": {
             "DOCKER_IMAGE_NAME": "<supply-your-image>",
-            "IBDEVICES": "mlx5_0",
             "SKIP_DEEPEP": "1"
         },
         "args": ""

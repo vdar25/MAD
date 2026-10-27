@@ -8,7 +8,7 @@ MASTER_PORT="${MASTER_PORT:-2373}"
 NODE_RANK="${NODE_RANK:-0}"
 NNODES="${NNODES:-1}"
 IPADDRS="${IPADDRS:-localhost}"
-IBDEVICES="${IBDEVICES:-mlx5_0}"
+IBDEVICES="${IBDEVICES:-}"
 SKIP_DEEPEP="${SKIP_DEEPEP:-1}"
 
 host_ip=$(hostname -I | awk '{print $1}')
@@ -18,7 +18,8 @@ host_name=$(hostname)
 #python $MAD_REPO_PATH/utils/socket_barrier.py --local-ip ${host_ip} --local-port 2200 --enable-port --node-ips ${IPADDRS} --node-ports 2200
 
 echo "$IPADDRS"
-echo "$IBDEVICES"
+# MoRI matches each GPU to its own NIC; MORI_RDMA_DEVICES restricts the candidates
+echo "IBDEVICES: ${IBDEVICES:-<unset>}  MORI_RDMA_DEVICES: ${MORI_RDMA_DEVICES:-<all>}"
 
 SERVER_IP=$(echo "$IPADDRS" | awk -F',' '{print $1}')
 echo "Server IP is - ${SERVER_IP}"
@@ -36,7 +37,7 @@ if [ "$NNODES" -eq 1 ]; then
         python tests/test_intranode.py 2>&1 | tee /run_logs/intranode_results.log || BENCH_RC=1
         sleep 20;
 
-        export ROCSHMEM_USE_IB_HCA=$IBDEVICES
+        [ -n "$IBDEVICES" ] && export ROCSHMEM_USE_IB_HCA=$IBDEVICES
         export ROCSHMEM_HEAP_SIZE=4147483648
         python tests/test_low_latency.py 2>&1 | tee /run_logs/low_latency_1N_results.log || BENCH_RC=1
     else
@@ -46,7 +47,7 @@ if [ "$NNODES" -eq 1 ]; then
     echo "----- Performing Intranode MoRI -----"
     cd $MORI_PATH
     export PYTHONPATH=$PYTHONPATH:$MORI_PATH
-    export GLOO_SOCKET_IFNAME=$(ip route | grep '^default' | awk '{print $NF}' | head -n 1)
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$(ip route | grep '^default' | awk '{print $NF}' | head -n 1)}
     python tests/python/ops/bench_dispatch_combine.py 2>&1 | tee /run_logs/mori_intranode_results.log || BENCH_RC=1
 
     echo "----- Performing low latency mori ----"
@@ -85,7 +86,7 @@ else
 
     echo "---- Running mori internode tests -------"
     cd $MORI_PATH
-    export GLOO_SOCKET_IFNAME=$(ip route | grep '^default' | awk '{print $NF}' | head -n 1)
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-$(ip route | grep '^default' | awk '{print $NF}' | head -n 1)}
     torchrun --nnodes=$NNODES \
         --node_rank=$NODE_RANK \
         --nproc_per_node=1 \
@@ -107,5 +108,6 @@ fi
 if [[ -f "$MAD_REPO_PATH/parse_ep_to_csv.py" ]]; then
     python3 $MAD_REPO_PATH/parse_ep_to_csv.py /run_logs -o /run_logs/perf.csv 2>&1
 fi
+chown -R "$(stat -c '%u:%g' /run_logs)" /run_logs 2>/dev/null || true
 
 exit $BENCH_RC

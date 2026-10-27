@@ -32,12 +32,11 @@ WORKDIR /sgl-workspace
 
 # ========== MORI ==========
 WORKDIR /sgl-workspace/mori
-# v1.2.3.post1
-ARG MORI_COMMIT="67632e80e2e492184b589904b63225f82d45537c"
-# Set INSTALL_MORI=1 to build/install MoRI at MORI_COMMIT; any other value skips it.
-ARG INSTALL_MORI=1
 RUN apt-get update && apt-get install -y --no-install-recommends git ibverbs-utils libibverbs-dev openmpi-bin libopenmpi-dev libpci-dev libdw1 locales libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc cmake libdrm-dev
-RUN if [ "${INSTALL_MORI}" = "1" ]; then echo "INSTALL_MORI=1: installing MoRI at ${MORI_COMMIT}" && git checkout main && git fetch origin && git pull origin main && git checkout ${MORI_COMMIT} && pip install -r requirements-build.txt Cython && MORI_GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e . ; else echo "INSTALL_MORI=${INSTALL_MORI}: skipping MoRI installation"; fi
+ARG MORI_REF="v1.2.3.post1"
+# Set INSTALL_MORI=1 to build/install MoRI at MORI_REF; any other value skips it.
+ARG INSTALL_MORI=1
+RUN if [ "${INSTALL_MORI}" = "1" ]; then echo "INSTALL_MORI=1: installing MoRI ${MORI_REF}" && git checkout main && git fetch origin --tags --force && git pull origin main && git checkout ${MORI_REF} && echo "MoRI ${MORI_REF} is $(git rev-parse HEAD)" && pip install -r requirements-build.txt Cython && MORI_GPU_ARCHS="${GPU_ARCH_LIST}" pip install --no-build-isolation -e . ; else echo "INSTALL_MORI=${INSTALL_MORI}: skipping MoRI installation"; fi
 ENV MORI_ROOT=/sgl-workspace/mori
 # The MoRI install can leave a half-built JIT cache whose lock files hang every later run; kernels recompile at first use.
 RUN rm -rf /root/.mori /tmp/mori_jit_*
