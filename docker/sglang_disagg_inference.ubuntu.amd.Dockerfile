@@ -24,7 +24,7 @@
 # SOFTWARE.
 #
 #################################################################################
-ARG BASE_DOCKER=lmsysorg/sglang:v0.5.12.post1-rocm720-mi30x
+ARG BASE_DOCKER=lmsysorg/sglang:v0.5.22-rocm10-mi30x
 FROM $BASE_DOCKER
 
 RUN sed -i 's|http://|https://|g' /etc/apt/sources.list
@@ -39,8 +39,9 @@ RUN pip install --upgrade sglang-router
 WORKDIR /sgl-workspace/mori
 
 ARG MORI_COMMIT="158c7e8335a0b19b3f1f422ff134d7869252135e"
-# Set INSTALL_MORI=1 to build/install MoRI at MORI_COMMIT; any other value skips it.
-ARG INSTALL_MORI=1
+# The lmsysorg/sglang ROCm bases ship a MoRI matched to their SGLang, so the
+# default keeps it. INSTALL_MORI=1 rebuilds MoRI at MORI_COMMIT instead.
+ARG INSTALL_MORI=0
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
