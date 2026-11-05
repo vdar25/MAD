@@ -1,0 +1,64 @@
+# madengine cards for this recipe. models.json is generated from this file:
+#   python3 gen_models_json.py           # rewrite models.json
+#   python3 gen_models_json.py --check   # fail if models.json is out of date
+#
+# Card name: pyt_sglang_disagg_<variant>[_<suffix>]_<slug>. Each card's env_vars
+# are the variant's, then the group's; xP/yD default to 1/1.
+
+card:
+  dockerfile: ../../docker/sglang_disagg_inference
+  scripts: run_xPyD_models.slurm
+  url: ""
+  data: huggingface
+  n_gpus: "-1"
+  owner: mad.support@amd.com
+  training_precision: ""
+  timeout: -1
+  # madengine requires the key. Node count comes from distributed.nnodes, not sbatch flags here.
+  args: ""
+  tags: [pyt, sglang, sglang_disagg, "{variant}", inference]
+  env_vars:
+    DOCKER_IMAGE_NAME: <supply-your-image>
+
+slugs:
+  Llama-3.1-8B-Instruct: llama-3.1-8b
+  Qwen3-32B: qwen3-32b
+  amd-Llama-3.3-70B-Instruct-FP8-KV: llama-3.3-70b-fp8
+  Llama-3.1-405B-Instruct-FP8-KV: llama-3.1-405b-fp8
+  Mixtral-8x7B-Instruct-v0.1: mixtral-8x7b
+  DeepSeek-V3: deepseek-v3
+  DeepSeek-R1: deepseek-r1
+
+variants:
+  mori_io:
+    KV_TRANSFER_BACKEND: mori
+    PARALLEL_MODE: tp
+  mori_dp:
+    KV_TRANSFER_BACKEND: mori
+    PARALLEL_MODE: wide_ep
+  mooncake:
+    KV_TRANSFER_BACKEND: mooncake
+    PARALLEL_MODE: tp
+
+groups:
+  - variant: mori_io
+    env_vars: {BENCHMARK_COMBINATIONS: 1024/1024}
+    models: [Llama-3.1-8B-Instruct, Qwen3-32B, amd-Llama-3.3-70B-Instruct-FP8-KV,
+             Llama-3.1-405B-Instruct-FP8-KV, Mixtral-8x7B-Instruct-v0.1, DeepSeek-V3, DeepSeek-R1]
+  - variant: mori_dp
+    env_vars: {BENCHMARK_COMBINATIONS: 1024/1024}
+    models: [DeepSeek-V3, DeepSeek-R1]
+  - variant: mooncake
+    env_vars: {BENCHMARK_COMBINATIONS: 1024/1024}
+    models: [Llama-3.1-8B-Instruct, Qwen3-32B, amd-Llama-3.3-70B-Instruct-FP8-KV,
+             Llama-3.1-405B-Instruct-FP8-KV, Mixtral-8x7B-Instruct-v0.1, DeepSeek-V3, DeepSeek-R1]
+  - variant: mori_io
+    suffix: agentic
+    tags: [agentic]
+    env_vars: {BENCHMARK_SCRIPT: agentic, AGENTIC_WORKLOAD: conformance_256k}
+    models: [Qwen3-32B]
+  - variant: mori_dp
+    suffix: agentic
+    tags: [agentic]
+    env_vars: {BENCHMARK_SCRIPT: agentic, AGENTIC_WORKLOAD: conformance_256k}
+    models: [DeepSeek-V3]

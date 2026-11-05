@@ -34,28 +34,21 @@ def parse_benchmark_log(log_file: str) -> Dict[Tuple[int, int, int], Dict]:
     # Split by benchmark result sections
     sections = re.split(r'============ Serving Benchmark Result ============', content)
     
-    current_input_seq_len = None
-    current_output_seq_len = None
-    current_concurrency = None
-    
-    for i, section in enumerate(sections[1:], 1):  # Skip first empty section
-        # Look for configuration in previous sections (from RUNNING line)
-        if i > 1:
-            prev_section = sections[i-1]
-            
-            # Extract config: prompts  isl <num> osl <num> con <num>
-            config_match = re.search(r'RUNNING: prompts\s+isl\s+(\d+)\s+osl\s+(\d+)\s+con\s+(\d+)', prev_section)
-            if config_match:
-                current_input_seq_len = int(config_match.group(1))
-                current_output_seq_len = int(config_match.group(2))
-                current_concurrency = int(config_match.group(3))
+    for i in range(1, len(sections)):
+        # A result belongs to the last RUNNING line before it. A result with none
+        # (the warmup, when the whole file is parsed) is skipped, and a run that
+        # failed without a result does not shift the ones after it.
+        configs = re.findall(r'RUNNING: prompts\s+(?:\d+\s+)?isl\s+(\d+)\s+osl\s+(\d+)\s+con\s+(\d+)',
+                             sections[i - 1])
+        if not configs:
+            continue
+        current_input_seq_len, current_output_seq_len, current_concurrency = map(int, configs[-1])
         
         # Extract Total token throughput (tok/s) from benchmark result section
-        throughput_match = re.search(r'Total token throughput \(tok/s\):\s+([\d.]+)', section)
+        throughput_match = re.search(r'Total token throughput \(tok/s\):\s+([\d.]+)', sections[i])
         throughput = float(throughput_match.group(1)) if throughput_match else None
         
-        # Only process if we have a valid configuration from RUNNING line and throughput
-        if current_input_seq_len and current_output_seq_len and current_concurrency and throughput is not None:
+        if throughput is not None:
             config_key = (current_input_seq_len, current_output_seq_len, current_concurrency)
             
             # Update results for this configuration
@@ -103,17 +96,18 @@ def _get_run_metadata(pipeline: str = "sglang"):
     import os
     xP = os.environ.get('xP', '1')
     yD = os.environ.get('yD', '1')
-    dp_mode = os.environ.get('DP_MODE', '0')
-    run_mori = os.environ.get('RUN_MORI', '0')
     gpus = os.environ.get('GPUS_PER_NODE', '8')
+    mode = os.environ.get('PARALLEL_MODE') or ('wide_ep' if os.environ.get('DP_MODE') == '1' else 'tp')
+    transfer = os.environ.get('KV_TRANSFER_BACKEND') or (
+        'mooncake' if os.environ.get('RUN_MORI') == '0' else 'mori')
 
-    # Determine backend tag
-    if dp_mode == '1':
-        backend = 'mori_dp'
-    elif run_mori == '1':
+    # Tag names match the models.json card variants.
+    if mode in ('wide_ep', 'dp'):
+        backend = f'{transfer}_dp'
+    elif transfer == 'mori':
         backend = 'mori_io'
     else:
-        backend = 'mooncake'
+        backend = transfer
 
     return {
         'pipeline': pipeline,
@@ -123,10 +117,21 @@ def _get_run_metadata(pipeline: str = "sglang"):
         'nnodes': str(int(xP) + int(yD)),
         'gpus_per_node': gpus,
         'docker_image': os.environ.get('DOCKER_IMAGE_NAME', ''),
-        'machine_name': os.environ.get('SLURM_JOB_NODELIST', ''),
+        'machine_name': os.environ.get('SELECTED_NODES') or os.environ.get('SLURM_JOB_NODELIST', ''),
         'launcher': 'slurm_multi',
-        'gpu_architecture': 'gfx942',
+        'gpu_architecture': os.environ.get('MAD_GPU_ARCH') or _gpu_arch(),
     }
+
+
+def _gpu_arch() -> str:
+    """The first GPU's gfx target, from rocminfo; empty if it cannot be read."""
+    import subprocess
+    try:
+        out = subprocess.run(['rocminfo'], capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    match = re.search(r'\bgfx[0-9a-f]+\b', out)
+    return match.group(0) if match else ''
 
 
 def save_perf_csv(results: Dict[Tuple[int, int, int], Dict], output_file: str,
@@ -194,7 +199,7 @@ def main():
 
     if not results:
         print("No benchmark results found in log file.")
-        return
+        sys.exit(1)
 
     # Generate output filename
     if args.output:

@@ -1,328 +1,232 @@
-## List of Models - focus SGLang Disaggregated P/D inference
+# SGLang disaggregated prefill/decode inference
 
-Dense Models
-- Qwen3-32B (https://huggingface.co/Qwen/Qwen3-32B)
-- meta-llama/Llama-3.1-8B-Instruct (https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
-- amd/Llama-3.3-70B-Instruct-FP8-KV (https://huggingface.co/amd/Llama-3.3-70B-Instruct-FP8-KV)
-- amd/Llama-3.1-405B-Instruct-FP8-KV (https://huggingface.co/amd/Llama-3.1-405B-Instruct-FP8-KV)
+Runs SGLang with prefill and decode on separate nodes (xP prefill + yD decode),
+KV cache moved between them over RDMA (MoRI or Mooncake), an `sglang_router` in
+front, and a benchmark through the router. One Slurm job, one container per node.
 
-MoE Models
-- DeepSeek-V3 (https://huggingface.co/deepseek-ai/DeepSeek-V3)
-- DeepSeek-R1 (https://huggingface.co/deepseek-ai/DeepSeek-R1)
-- Mixtral-8x7B-v0.1 (https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
+[ARCHITECTURE.md](ARCHITECTURE.md) explains the design, walks through onboarding
+a model, and lists what changed from the previous recipe.
 
-This repository contains scripts and documentation to launch PD Disaggregation for above models. You will find setup instructions, node assignment details and benchmarking commands.
+The recipe is split so that each kind of change touches one file:
 
-## 📝 Prerequisites
+| To change | Edit |
+|-----------|------|
+| A model's server flags or environment, or add a model | `models.yaml` |
+| A KV transfer backend | `models.yaml`, `backends:` section |
+| Paths, NICs and fabric tuning for a cluster | `clusters/<name>.sh` |
+| A default, or an older setting name | `settings.sh` |
+| What is measured | `benchmarks/<name>.sh` |
+| The madengine cards | `matrix.yaml`, then `python3 gen_models_json.py` |
 
-- A Slurm cluster with required Nodes -> xP + yD (minimum size 2: xP=1 and yD=1)
-- Docker container with SGLang, MoRI and NIC drivers built-in. Refer to Building the Docker image section below.
-- Access to a shared filesystem for log collection( cluster specific)
-
-
-## Building the Docker image
-Access the Dockerfile located at `docker/sglang_disagg_inference.ubuntu.amd.Dockerfile`.
-It uses `lmsysorg/sglang:v0.5.12.post1-rocm720-mi30x` as the base docker image.
+## Quick start
 
 ```bash
-docker build  -t sglang_disagg_pd_image -f sglang_disagg_inference.ubuntu.amd.Dockerfile .
+cd scripts/sglang_disagg
+export DOCKER_IMAGE_NAME=<image>   # built from docker/sglang_disagg_inference.ubuntu.amd.Dockerfile
+export MODEL_NAME=Llama-3.1-8B-Instruct xP=1 yD=1
+sbatch -N 2 -p <partition> run_xPyD_models.slurm
 ```
 
-### Build arguments
+Preview every node's server and router command and environment, without a job or GPUs:
+
+```bash
+MODEL_NAME=DeepSeek-V3 PARALLEL_MODE=wide_ep xP=2 yD=2 python3 render.py plan
+```
+
+Through madengine, the cards in `models.json` run the same script (`slurm_multi`):
+
+```bash
+madengine run --tags pyt_sglang_disagg_mori_io_llama-3.1-8b \
+  --additional-context '{"slurm": {"partition": "<partition>"}}'
+```
+
+## Settings
+
+All settings are environment variables; anything already set wins over the
+defaults, which all live in `settings.sh`.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MODEL_NAME` | (required) | Entry in `models.yaml` (`python3 render.py models` lists them) |
+| `DOCKER_IMAGE_NAME` | (required) | Image to run on every node |
+| `xP`, `yD` | `1`, `1` | Prefill and decode node counts |
+| `PARALLEL_MODE` | `tp` | `tp`: one tensor-parallel server per node. `wide_ep`: all prefill nodes form one data/expert-parallel server, likewise decode (models with a `modes.wide_ep` block) |
+| `KV_TRANSFER_BACKEND` | `mori` | Entry under `backends:` in `models.yaml`: `mori` or `mooncake` |
+| `BENCHMARK_SCRIPT` | `sweep` | `benchmarks/<name>.sh` (`sweep`, `agentic`) or `none` |
+| `CLUSTER` | `auto` | `clusters/<name>.sh`; `auto` matches the host against each profile's `# hosts:` line; `none`, or no match, uses the defaults in `settings.sh` |
+| `MODEL_PATH` | searched | Weights directory; by default `<root>/<name>` for each root in the profile's `MODEL_ROOTS` |
+| `DEDICATED_ROUTER` | `0` | `1` puts the router on its own node (xP + yD + 1 nodes) |
+| `PREFILL_TP_SIZE`, `DECODE_TP_SIZE` | GPUs per node | Tensor-parallel size in `tp` mode; a multiple of `GPUS_PER_NODE` spans nodes |
+| `GPUS_PER_NODE` | `8` | |
+| `EXTRA_SERVER_ARGS`, `EXTRA_PREFILL_ARGS`, `EXTRA_DECODE_ARGS`, `EXTRA_ROUTER_ARGS` | | Appended last, so they override `models.yaml` |
+| `ENABLE_RADIX_CACHE`, `ENABLE_SERVER_METRICS` | `0` | Apply the `overlays` in `models.yaml` (both on for `agentic`) |
+| `BENCHMARK_COMBINATIONS` | `1024/1024 8192/1024` | Sweep: ISL/OSL pairs |
+| `BENCHMARK_CONCURRENCY` | `8 16 32 64 128 256 512` | Sweep: concurrency levels |
+| `BENCHMARK_ITR` | `1` | Sweep: repetitions; the best result per point is kept |
+| `WORKER_STARTUP_TIMEOUT` | `3600` | Seconds to wait for the first completion through the router |
+| `SKIP_CURL_TEST` | `0` | `1` skips the smoke-test completion |
+
+NCCL's own debug output is off; set `NCCL_DEBUG=INFO` (and `NCCL_DEBUG_SUBSYS`)
+for a run to turn it on. Any `NCCL_*`, `MORI_*`, `SGLANG_*` or similar variable
+set at submit time reaches the servers and wins over the catalog and profile.
+
+Older names still work: `DP_MODE=1` means `PARALLEL_MODE=wide_ep`, `RUN_MORI=0`
+means `KV_TRANSFER_BACKEND=mooncake`, `SKIP_BENCHMARK=1` means `BENCHMARK_SCRIPT=none`,
+and `LOG_PATH` sets the log root. `settings.sh` does the mapping.
+
+## Adding things
+
+**A model.** Put the weights under one of the cluster's `MODEL_ROOTS` as
+`<root>/<MODEL_NAME>` (or set `MODEL_PATH`) and add an entry to `models.yaml`.
+An empty entry (`MyModel: {}`) runs with the shared defaults; add only the flags,
+or `env:` variables, that differ. `extends:` starts from another entry. Add a
+`modes.wide_ep` block to allow `PARALLEL_MODE=wide_ep`. To get madengine cards,
+add the model to `matrix.yaml` and run `python3 gen_models_json.py`.
+
+**A cluster.** Add `clusters/<name>.sh` with a `# hosts:` glob and the site's
+values (model roots, log root, mounts, NICs); `settings.sh` lists every site
+setting and its default, and `clusters/oci-m2m.sh` is a worked example.
+
+**A benchmark.** Add `benchmarks/<name>.sh`. It runs on node 0 once the router
+serves completions, with `ROUTER_HOST`, `ROUTER_PORT`, `METRICS_ENDPOINTS` (the
+first prefill and decode servers), `MODEL_PATH`, `MODEL_NAME` and `RUN_DIR` set,
+and writes its results (and `perf.csv` for madengine) to `RUN_DIR`.
+
+**A new SGLang version.** Change `BASE_DOCKER`, then check that every flag and
+`SGLANG_*` variable in the catalog still exists in it:
+
+```bash
+docker run --rm -v $PWD:/r -w /r --entrypoint python3 <image> render.py check
+```
+
+## How a run works
+
+1. `run_xPyD_models.slurm` (host) only places containers: it loads the cluster
+   profile, picks the nodes and their addresses, finds the weights on every node,
+   and starts one container per node with `srun --kill-on-bad-exit`.
+2. `launch.sh` (each container) asks `render.py` for this node's role, server
+   environment and command, validating the settings on the way, and starts the
+   server. Node 0 also writes `plan.txt`, starts the router, waits until a
+   completion goes through prefill and decode, runs a smoke test, then the benchmark.
+3. Any node whose server exits, or bad settings, or a failed benchmark, ends the
+   whole job with a non-zero status. When node 0 finishes, the other nodes see
+   its router go away and stop.
+
+`render.py` merges `models.yaml` (defaults, then the model; each base, then mode,
+then role), the backend, and the overlays into one flag map and one environment
+per role, so a later layer replaces single values and `false` (or `null`) removes one.
+
+## Logs
+
+`$LOG_ROOT/$SLURM_JOB_ID/` (the profile sets `LOG_ROOT`):
+
+| File | Contents |
+|------|----------|
+| `plan.txt` | Every node's role, environment and command |
+| `launch_NODE<N>.log` | Each container's output |
+| `prefill_NODE<N>.log`, `decode_NODE<N>.log` | Server logs, starting with the exact command |
+| `proxy_NODE0.log` | Router log |
+| `curl_smoke_NODE0.log` | Smoke-test response |
+| `benchmark_*_CONCURRENCY.{log,csv,jsonl}` | Sweep output, parsed results, per-run JSON |
+| `perf.csv` | madengine results |
+
+To re-parse a sweep log (it keeps the best throughput per ISL/OSL/concurrency
+point, ignoring the warm-up):
+
+```bash
+python3 parse_to_csv.py <benchmark_..._CONCURRENCY.log> -o results.csv [--perf-csv perf.csv --model-name NAME]
+```
+
+## Docker image
+
+`docker/sglang_disagg_inference.ubuntu.amd.Dockerfile` adds `sglang-router` to an
+`lmsysorg/sglang` ROCm image.
 
 | Arg | Default | Description |
 |-----|---------|-------------|
-| `INSTALL_MORI` | `1` | When `1`, builds and installs MoRI at `MORI_COMMIT`. Set to any other value (e.g. `0`) to skip MoRI installation entirely. |
-| `MORI_COMMIT` | `158c7e8335a0b19b3f1f422ff134d7869252135e` | MoRI commit to check out and install when `INSTALL_MORI=1`. |
-| `BASE_DOCKER` | `lmsysorg/sglang:v0.5.12.post1-rocm720-mi30x` | Base SGLang ROCm image. |
-| `GPU_ARCH` | `gfx942` | Target AMD GPU architecture. |
-
-Examples:
+| `BASE_DOCKER` | `lmsysorg/sglang:v0.5.22-rocm10-mi30x` | Base SGLang ROCm image (`-mi35x` for MI355X) |
+| `INSTALL_MORI` | `0` | `1` rebuilds MoRI at `MORI_COMMIT` instead of keeping the base image's |
+| `MORI_COMMIT` | `158c7e8…` | MoRI commit used when `INSTALL_MORI=1` |
+| `GPU_ARCH` | `gfx942` | Target GPU architecture |
 
 ```bash
-# Default build: installs MoRI pinned at MORI_COMMIT
-docker build -t sglang_disagg_pd_image -f sglang_disagg_inference.ubuntu.amd.Dockerfile .
-
-# Skip MoRI (e.g. when using Mooncake KV transfer only)
-docker build --build-arg INSTALL_MORI=0 -t sglang_disagg_pd_image -f sglang_disagg_inference.ubuntu.amd.Dockerfile .
-
-# Pin a different MoRI commit
-docker build --build-arg MORI_COMMIT=<sha> -t sglang_disagg_pd_image -f sglang_disagg_inference.ubuntu.amd.Dockerfile .
+docker build -t sglang_disagg_pd_image -f docker/sglang_disagg_inference.ubuntu.amd.Dockerfile docker
 ```
 
-## Scripts
-
-| File | Description |
-|------|-------------|
-| `run_xPyD_models.slurm` | SLURM script to launch docker containers on all nodes via `sbatch` |
-| `sglang_disagg_mori_io_ep.sh` | Container entrypoint — starts prefill/decode servers, proxy, and benchmark |
-| `models.yaml` | Model-specific CLI flags for all supported models |
-| `mori_ep_env.sh` | RDMA/NCCL/Gloo environment variables |
-| `benchmark_xPyD.sh` | Concurrency sweep benchmark using sglang bench_serving |
-| `benchmark_parser.py` | Log parser for CONCURRENCY benchmark logs |
-
-## Quick Start
+## Tests
 
 ```bash
-git clone https://github.com/ROCm/MAD.git
-cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<DOCKER_IMAGE_NAME>
-export xP=1
-export yD=1
-export MODEL_NAME=Llama-3.1-8B-Instruct
-export RUN_MORI=1  # MoRI (default). Set RUN_MORI=0 for Mooncake (KV_TRANSFER_BACKEND=mooncake)
-
-# num_nodes = xP + yD
-sbatch -N 2 -n 2 --nodelist=<node1,node2> run_xPyD_models.slurm
+python3 tests/test_render.py          # renderer, topology, cards (no GPUs needed)
+python3 gen_models_json.py --check    # models.json matches matrix.yaml
 ```
 
-## Current Support Status
+## Agentic replay benchmark
 
-### KV Cache Transfer Backend
+`BENCHMARK_SCRIPT=agentic` replays real Claude Code agentic coding traces with the
+`inferencex-agentx-mvp` scenario from [SemiAnalysisAI aiperf](https://github.com/SemiAnalysisAI/aiperf),
+through the router. The workload is highly prefix-repetitive (each turn re-sends
+the accumulated context), so it exercises the radix prefix cache and reports a
+**measured** `gpu_cache_hit_rate` alongside the dataset's theoretical ceiling.
+Selecting it turns on the `radix_cache` and `server_metrics` overlays.
 
-The unified launcher (`sglang_disagg_mori_io_ep.sh`) selects the disaggregation KV-cache transfer backend (`--disaggregation-transfer-backend`) via `RUN_MORI`. The backend is intentionally kept out of `models.yaml` so model configs stay backend-agnostic, and it applies to all supported models.
+> **New to AgentX?** [scripts/common/agentx/README.md](../common/agentx/README.md) has the
+> onboarding path, config schema and [examples](../common/agentx/README.md#examples);
+> [HOW_IT_WORKS.md](../common/agentx/HOW_IT_WORKS.md) explains the replay mechanism.
 
-| `RUN_MORI` | `KV_TRANSFER_BACKEND` | Backend | Status |
-|------------|-----------------------|---------|--------|
-| `1` | `mori` | MoRI IO | Supported |
-| `0` | `mooncake` | Mooncake | Supported |
-
-### WideEP/LargeEP Parallelism Mode (`DP_MODE`)
-
-`PARALLEL_MODE` is derived strictly from `DP_MODE`, which selects the flag set from `models.yaml`.
-
-| `DP_MODE` | `PARALLEL_MODE` | Flags applied | Supported models |
-|-----------|-----------------|---------------|------------------|
-| `0` (default) | `tp` | `base_flags` + `tp_flags` + `prefill.tp` / `decode.tp` | All models |
-| `1` | `dp` | `base_flags` + `dp_flags` (`--moe-a2a-backend mori`, DP attention) + `prefill.dp` / `decode.dp` | DeepSeek-V3, DeepSeek-R1 only |
-
-- `DP_MODE=1` enables MoRI expert parallelism (EP) with DP attention and currently requires `RUN_MORI=1` (MoRI IO).
-- It is restricted by an allowlist (`MORI_DP_MODE1_ALLOWED_MODELS`) enforced in both `run_xPyD_models.slurm` and `sglang_disagg_mori_io_ep.sh`. Launching any other model with `DP_MODE=1` exits with an error — use `DP_MODE=0` (TP) for all non-DeepSeek models.
-
-## Log Files
-
-Logs are written to `${LOG_PATH}/${SLURM_JOB_ID}/`:
-
-| File | Description |
-|------|-------------|
-| `pd_sglang_bench_serving.sh_NODE<N>.log` | Main per-node log |
-| `prefill_NODE<N>.log` | Prefill server log |
-| `decode_NODE<N>.log` | Decode server log |
-| `benchmark_*_CONCURRENCY.log` / `.csv` | Benchmark results |
-
-## Benchmarking
-
-Parse benchmark results:
-```bash
-python3 benchmark_parser.py <log_path>/benchmark_XXX_CONCURRENCY.log
-```
-
-Smoke test from the proxy node:
-```bash
-curl -X POST http://127.0.0.1:2322/generate \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Let me tell you a story", "sampling_params": {"temperature": 0.3}}'
-```
-
-## Agentic Replay Benchmark
-
-The agentic replay benchmark replays real Claude Code agentic coding traces using the `inferencex-agentx-mvp` scenario from [SemiAnalysisAI aiperf](https://github.com/SemiAnalysisAI/aiperf), driven against the sglang router (`:2322`). This workload is highly prefix-repetitive (each turn re-sends the accumulated context), so it exercises the radix prefix cache and reports a **measured** `gpu_cache_hit_rate` alongside the dataset's theoretical ceiling.
-
-> **New to AgentX? Start here:** [scripts/common/agentx/README.md](../common/agentx/README.md) has the onboarding path, config schema, and copy-paste [examples](../common/agentx/README.md#examples); [HOW_IT_WORKS.md](../common/agentx/HOW_IT_WORKS.md) explains the replay mechanism.
-
-It is a drop-in alternative to the default `benchmark_xPyD.sh` concurrency sweep, selected via `BENCHMARK_SCRIPT=agentic`. No GitHub Actions / CI is involved — it runs through the same `run_xPyD_models.slurm` entrypoint as the other benchmarks.
-
-> **Breaking change:** the legacy `AGENTIC` env shorthand has been removed. Use `BENCHMARK_SCRIPT=agentic` instead.
-
-The four validated agentic configurations are declared as first-class, `agentic`-tagged `models.json` entries. Discover them with:
-
-```bash
-madengine run --tags agentic
-```
-
-#### Validated agentic configurations
-
-| Backend | Model | Connector | Entry Name |
-|---------|-------|-----------|------------|
-| sglang | Qwen3-32B | mori_io | `pyt_sglang_disagg_mori_io_agentic_qwen3-32b` |
-| sglang | DeepSeek-V3 | mori_dp | `pyt_sglang_disagg_mori_dp_agentic_deepseek-v3` |
-| vllm | DeepSeek-V3 | mori | `pyt_vllm_disagg_mori_agentic_deepseek-v3` |
-| vllm | DeepSeek-V3-5layer | mori | `pyt_vllm_disagg_mori_agentic_deepseek-v3-5layer` |
-
-### Quick start (canonical DeepSeek-V3 1P/1D)
+The validated agentic configurations are `agentic`-tagged cards: `madengine run --tags agentic`.
 
 ```bash
 cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<mori-sglang-image>          # e.g. rocm/pytorch-private:sglang-...-mori-YYYYMMDD
-export BENCHMARK_SCRIPT=agentic                        # selects benchmark_agentic.sh
-export RUN_MORI=1 DP_MODE=1 xP=1 yD=1 MODEL_NAME=DeepSeek-V3
+export DOCKER_IMAGE_NAME=<image> BENCHMARK_SCRIPT=agentic
+export PARALLEL_MODE=wide_ep xP=1 yD=1 MODEL_NAME=DeepSeek-V3
 export DURATION=900 AGENTIC_CONC=16 AGENTIC_CACHE_WARMUP_DURATION=300 MAX_MODEL_LEN=160000
-
-# 3 same-subnet (10.158.x) nodes with the model on local NVMe
-sbatch -N 3 -n 3 -p amd-rccl --time=90 \
-  --nodelist=<router-node>,<prefill-node>,<decode-node> \
-  run_xPyD_models.slurm
+sbatch -N 2 -p <partition> --time=90 run_xPyD_models.slurm
 ```
 
-`BENCHMARK_SCRIPT=agentic` selects `benchmark_agentic.sh`; the in-container launcher then auto-enables server-side Prometheus metrics and strips `--disable-radix-cache` (cache ON).
-
-### Environment variables
-
-Full AgentX env reference: [scripts/common/agentx/README.md#environment-variable-reference](../common/agentx/README.md#environment-variable-reference).
-The table below lists only the launcher-specific knobs; the shared AgentX
-variables (`AGENTIC_CONC`, `AGENTIC_CACHE_WARMUP_DURATION`, `MAX_MODEL_LEN`,
-`AGENTIC_CONFIG`, `AGENTIC_WORKLOAD`, `AGENTIC_STRICT_CONTEXT`,
-`AGENTIC_HF_ISL_TAIL`, …) are documented centrally.
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BENCHMARK_SCRIPT` | `sweep` | Set to `agentic` to run the agentic replay (`sweep` -> `benchmark_xPyD.sh`, `agentic` -> `benchmark_agentic.sh`) |
-| `DURATION` | `120` | Benchmark duration in seconds (use `>=900` for a canonical/valid submission) |
-| `AGENTIC_PORT` | `2322` | sglang router port aiperf targets |
-| `ENABLE_SERVER_METRICS` | auto | `1` forces server Prometheus metrics on (auto-on for agentic) |
-| `ENABLE_RADIX_CACHE` | auto | `1` forces radix cache on i.e. strips `--disable-radix-cache` (auto-on for agentic) |
-| `SUITE_CORPUS_FORCE` | `0` | Set `1` to regenerate a cached corpus after editing a profile. |
-
-Note: `AGENTIC_SERVER_METRICS` is set automatically by the launcher to the space-separated server metrics endpoints (`<prefill_ip>:3000 <decode_ip>:3000`) and consumed by aiperf's `--server-metrics`; it is not a boolean toggle.
-
-For config schema, profile authoring, and Tier 1/Tier 2 knobs, see:
-- [AgentX core README](../common/agentx/README.md)
-- [Profile authoring guide](../common/agentx/profiles/README.md)
-- [Config examples cookbook](../common/agentx/README.md#examples)
-
-### Running HF (weka) trace datasets on your own model
-
-The agentic suite (`scripts/common/agentx/`, driven by `benchmark_agentic_suite.sh` via an `AGENTIC_CONFIG=agentic.yaml`) can replay the SemiAnalysis HF weka corpora against *any* served model, not just the 256k/1M reference targets:
-
-- **Model-agnostic context gating.** Leave `serving.max_model_len` unset or `0` (or `MAX_MODEL_LEN=0`) and the suite resolves the served window automatically. On disaggregated serving the router front-end may not advertise `max_model_len`, so the window is resolved from the prefill worker (the first `host:port` in `AGENTIC_SERVER_METRICS`, auto-derived by the recipe) via `/v1/models` (`data[0].max_model_len`, with a `/get_server_info` fallback); a monolith front-end that does advertise it is auto-detected directly. Each hf workload gets a loader-derived ISL tail (a `_256k` loader → 262144, a full corpus → a conservative ~1M, override with `AGENTIC_HF_ISL_TAIL`). If the tail exceeds the served window the suite **WARNs** and caps `--max-context-length` at the window; `AGENTIC_STRICT_CONTEXT=1` **SKIP**s that workload instead. An explicit `max_model_len` / `MAX_MODEL_LEN` always wins.
-- **Tier 1 replay knobs (per workload).** `num_dataset_entries` (how many trace sessions to pull) and `trajectory: {min, max}` (start-window ratio) are per-workload fields; unset keeps today's defaults (`393`, `0.25`/`0.75`).
-- **Tier 2 local trim (fit a smaller model).** Add a `filter: {max_isl, max_turns, sample}` block to an hf workload/preset: the corpus is downloaded once, trimmed locally (drop sessions with any turn over `max_isl`, truncate to `max_turns`, randomly `sample` with seed 42), and replayed through `--input-file` — no server-side changes.
-- **Reusable presets.** Drop a `source: hf` file in `scripts/common/agentx/profiles/` (see `profiles/inferencex_256k.yaml`) and reference it with `preset: <name>`; it can bundle the loader, Tier 1/Tier 2 knobs, and a concurrency sweep + duration. Entry fields override the preset; env (`AGENTIC_CONC`/`DURATION`/`MAX_MODEL_LEN`) still wins.
-
-See `scripts/common/agentx/agentic.example.yaml` for a worked config.
-
-### Supported models and modes
-
-Agentic replay works for every model in the recipe allowlist. `DP_MODE=1` (MoRI wideEP) is only valid for the DeepSeek models; all others run `DP_MODE=0` (TP-only).
-
-| Model | `DP_MODE` | Notes |
-|-------|-----------|-------|
-| DeepSeek-V3 | 1 (wideEP) | Canonical agentic target |
-| DeepSeek-R1 | 1 (wideEP) | Same path as DeepSeek-V3 |
-| Qwen3-32B | 0 (TP) | |
-| Mixtral-8x7B-Instruct-v0.1 | 0 (TP) | |
-| Llama-3.1-8B-Instruct | 0 (TP) | Good quick smoke |
-| amd-Llama-3.3-70B-Instruct-FP8-KV | 0 (TP) | |
-| Llama-3.1-405B-Instruct-FP8-KV | 0 (TP) | Needs larger topology |
-
-Topology is `xP` prefill + `yD` decode + 1 router node (minimum 3 nodes, i.e. 1P/1D).
-
-### Invocation examples (agentic suite)
-
-**Note:** `AGENTIC_CONFIG` paths must be visible inside the container. The `$HOME:$HOME` bind mount means `$HOME/MAD/...` works if MAD is cloned at `$HOME/MAD`. Alternatively use `/opt/mooncake-cookbook/scripts/...` (the in-container `MOONCAKE_REPO_DIR` mount).
-
-#### 1. Multi-workload suite config
+Suite and preset runs (`AGENTIC_CONFIG` must be a path visible in the container;
+`$HOME` is mounted):
 
 ```bash
-cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<mori-sglang-image>
-export BENCHMARK_SCRIPT=agentic
-export RUN_MORI=1 DP_MODE=1 xP=1 yD=1 MODEL_NAME=DeepSeek-V3
-export AGENTIC_CONFIG=$HOME/MAD/scripts/common/agentx/agentic.example.yaml
-
-sbatch -N 3 -n 3 -p amd-rccl --time=90 \
-  --nodelist=<router-node>,<prefill-node>,<decode-node> \
-  run_xPyD_models.slurm
+export AGENTIC_CONFIG=$HOME/MAD/scripts/common/agentx/agentic.example.yaml   # multi-workload suite
+export AGENTIC_WORKLOAD=conformance_256k                                     # or a single preset
+export AGENTIC_WORKLOAD=conformance_512k MAX_MODEL_LEN=524288                # longer-context baseline
 ```
 
-#### 2. Single preset shorthand (no config file)
+Dry-run the suite plan from the login node, with no server:
 
 ```bash
-cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<mori-sglang-image>
-export BENCHMARK_SCRIPT=agentic
-export RUN_MORI=1 DP_MODE=1 xP=1 yD=1 MODEL_NAME=DeepSeek-V3
-export AGENTIC_WORKLOAD=conformance_256k   # config-less shorthand: runs just this preset
-
-sbatch -N 3 -n 3 -p amd-rccl --time=90 \
-  --nodelist=<router-node>,<prefill-node>,<decode-node> \
-  run_xPyD_models.slurm
-```
-
-#### 3. Longer-context baseline (Case-B 512k window)
-
-```bash
-cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<mori-sglang-image>
-export BENCHMARK_SCRIPT=agentic
-export RUN_MORI=1 DP_MODE=1 xP=1 yD=1 MODEL_NAME=DeepSeek-V3
-export AGENTIC_WORKLOAD=conformance_512k
-export MAX_MODEL_LEN=524288                # Case-B ISL tail needs the 512k window
-
-sbatch -N 3 -n 3 -p amd-rccl --time=90 \
-  --nodelist=<router-node>,<prefill-node>,<decode-node> \
-  run_xPyD_models.slurm
-```
-
-#### 4. Single entry selected from a config (smaller model)
-
-```bash
-cd scripts/sglang_disagg
-
-export DOCKER_IMAGE_NAME=<mori-sglang-image>
-export BENCHMARK_SCRIPT=agentic
-export RUN_MORI=1 DP_MODE=0 xP=1 yD=1 MODEL_NAME=Llama-3.1-8B-Instruct
-export AGENTIC_CONFIG=$HOME/MAD/scripts/common/agentx/agentic.example.yaml
-export AGENTIC_WORKLOAD=inferencex_small   # preset bundles filter: {max_isl, max_turns, sample}
-
-sbatch -N 3 -n 3 -p amd-rccl --time=90 \
-  --nodelist=<router-node>,<prefill-node>,<decode-node> \
-  run_xPyD_models.slurm
-```
-
-#### 5. DRY_RUN preview from the login node (no server)
-
-```bash
-cd $HOME/MAD
-
-# Prints the resolved N-workload plan + per-workload commands + context verdicts; no server needed.
 DRY_RUN=1 AGENTIC_CONFIG=$HOME/MAD/scripts/common/agentx/agentic.example.yaml \
   bash scripts/common/benchmark_agentic_suite.sh
 ```
 
-### Output files
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DURATION` | `120` | Benchmark duration in seconds (`>=900` for a canonical submission) |
+| `AGENTIC_PORT` | router port | Port aiperf targets |
+| `SUITE_CORPUS_FORCE` | `0` | `1` regenerates a cached corpus after editing a profile |
 
-Written to `/run_logs/$SLURM_JOB_ID/` (host `LOG_PATH/<jobid>/`):
+`AGENTIC_SERVER_METRICS` is set by the launcher to the first prefill and decode
+servers' `host:port`; aiperf reads their Prometheus metrics from it. The full
+AgentX variable reference is in
+[scripts/common/agentx/README.md](../common/agentx/README.md#environment-variable-reference).
+
+Output, in `$LOG_ROOT/$SLURM_JOB_ID/`:
 
 ```
-agentic_<jobid>_xP<n>_yD<n>_<model>.json   # aggregate metrics (parsed by validate_agentic_result.sh)
+agentic_<jobid>_xP<n>_yD<n>_<model>.json   # aggregate metrics
 aiperf_artifacts/                          # per-request logs, timeslices, server_metrics_export.{csv,json}
 ```
 
-Key fields in the aggregate JSON:
-- `request_metrics.cache.theoretical_cache_hit_rate` — dataset-derived ceiling.
-- `server_metrics.present` / `server_metrics.cache.gpu_cache_hit_rate` — **measured** runtime GPU cache hit rate.
-- `request_accounting` — `records_profiled` vs `records_error_dropped` (error rate is computed over measured requests, excluding warmup).
+Key fields: `request_metrics.cache.theoretical_cache_hit_rate` (dataset ceiling),
+`server_metrics.cache.gpu_cache_hit_rate` (measured), and `request_accounting`
+(profiled vs dropped requests). `scripts/common/validate_agentic_result.sh` runs at
+the end and gates on `AGENTIC_MAX_ERROR_RATE` (default `0.10`); `AGENTIC_MIN_CACHE_HIT`
+(default `0.30`) only warns. A low hit rate with `xP>1` usually means the router is
+not keeping a conversation's turns on the server holding its prefix.
 
-### Validation
+## Known issues
 
-`scripts/common/validate_agentic_result.sh` runs automatically at the end of the agentic benchmark and prints, e.g.:
-
-```
-[validate] requests: 70/72 ok  error_rate=2.8%
-[validate] gpu_cache_hit_rate: 32.4%
-[validate] throughput_per_gpu: 6247 tok/s
-[validate][PASS] error_rate within 10%
-```
-
-Thresholds: `AGENTIC_MAX_ERROR_RATE` (default `0.10`, gates PASS/WARN) and `AGENTIC_MIN_CACHE_HIT` (default `0.30`, warn-only). A low cache hit rate on `xP>1` usually indicates the router is not keeping a conversation's turns on the worker holding its prefix (session-affinity).
-
-## Known Issues
-For larger models, such as DeepSeekV3 and Llama-3.1-405B-Instruct-FP8-KV and higher concurrency(512+), errors with below signature is observed:<br>
-_'<TransferEncodingError: 400, message:\n  Not enough data to satisfy transfer length header.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n '_<br>
-This leads to dropping requests and lower throughput.This issue is being discussed on the SGLang forums.
+For larger models (DeepSeek-V3, Llama-3.1-405B-Instruct-FP8-KV) at concurrency 512
+and above, requests can fail with
+`TransferEncodingError: 400, message: Not enough data to satisfy transfer length header`,
+dropping requests and lowering throughput. This is being discussed on the SGLang forums.

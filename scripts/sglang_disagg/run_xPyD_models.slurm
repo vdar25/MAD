@@ -1,488 +1,145 @@
 #!/bin/bash
-#SBATCH --job-name=sglang-disagg   # Specify a custom string for your slurm batch job
-#SBATCH -N 2            # CHECK this to be right in batch jobs
-#SBATCH -n 2          # CHECK this to be right in batch jobs
+#SBATCH --job-name=sglang-disagg
 #SBATCH --ntasks-per-node=1
-# --spread-job intentionally removed: it spreads nodes across IB rails, which causes
-# NCCL ibv_modify_qp timeouts on cross-rail node pairs.
+#SBATCH --gres=gpu:8
+#SBATCH --time=24:00:00
 #
-# --switches=2: allow up to 2 IB switches (rails). select_same_rail_nodes() below
-# enforces per-role rail consistency. Set --switches=1 to force single rail.
-#SBATCH --switches=2
-#SBATCH --gres=gpu:8      # Request 8 GPUs and 8 NICs (use --gres if specific GPU resources are needed)
-#SBATCH --time=24:00:00         # Set a time limit for the job (HH:MM:SS)
-#SBATCH --output="/shared_inference/%u/model_blog_logs/slurm-%j.out"
-#SBATCH --error="/shared_inference/%u/model_blog_logs/slurm-%j.err"
+# SGLang disaggregated P/D inference: starts one container per node and runs
+# launch.sh in each. Submit with sbatch, run with bash inside an allocation, or
+# let madengine run it (slurm_multi), which supplies its own #SBATCH header.
+#
+#   DOCKER_IMAGE_NAME=<image> MODEL_NAME=Llama-3.1-8B-Instruct xP=1 yD=1 \
+#     sbatch -N 2 -p <partition> run_xPyD_models.slurm
+#
+# This script only places containers: nodes, their addresses, weights, mounts.
+# Each container validates the settings and renders its own command (render.py);
+# preview every node's command without a job with `python3 render.py plan`.
+set -uo pipefail
 
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-# ------------------------
-# Print current time in UTC and PST formats
-# ------------------------
-echo "=== Job Start Time ==="
-echo "UTC Time: $(TZ=UTC date '+%Y-%m-%d %H:%M:%S %Z')"
-echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
-echo "======================="
-echo ""
-
-# -----------------------------------------------------------------------------
-# DP_MODE=1 allowlist — must match MORI_DP_MODE1_ALLOWED_MODELS in sglang_disagg_mori_io_ep.sh
-# -----------------------------------------------------------------------------
-MORI_DP_MODE1_ALLOWED_MODELS=(
-    "DeepSeek-V3"
-    "DeepSeek-R1"
-)
-
-mori_model_allows_dp_mode_one() {
-    local name="$1"
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        [[ "$name" == "$m" ]] && return 0
-    done
-    return 1
-}
-
-mori_dp_mode1_allowed_models_lines() {
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        printf '  - %s\n' "$m"
-    done
-}
-
-# MoRI IO EP (`sglang_disagg_mori_io_ep.sh`): most models use DP_MODE=0 (tp only).
-MORI_EP_VALID_MODELS=( \
-    "Qwen3-32B" \
-    "Mixtral-8x7B-Instruct-v0.1" \
-    "Llama-3.1-8B-Instruct" \
-    "Llama-3.1-405B-Instruct-FP8-KV" \
-    "amd-Llama-3.3-70B-Instruct-FP8-KV" \
-    "DeepSeek-V3" \
-    "DeepSeek-R1" \
-)
-
-# Define valid model names
-VALID_MODELS=( \
-    "Qwen3-32B" \
-    "Mixtral-8x7B-Instruct-v0.1" \
-    "Llama-3.1-8B-Instruct" \
-    "Llama-3.1-405B-Instruct-FP8-KV" \
-    "amd-Llama-3.3-70B-Instruct-FP8-KV" \
-    "DeepSeek-V3" \
-    "DeepSeek-R1" \
-)
-
-model_allows_mori_ep() {
-    local m="$1"
-    for x in "${MORI_EP_VALID_MODELS[@]}"; do
-        [[ "$m" == "$x" ]] && return 0
-    done
-    return 1
-}
-
-# ---------------------------------------------------------------------------
-# Run file: always use sglang_disagg_mori_io_ep.sh (unified launcher).
-# RUN_MORI=0: sets KV_TRANSFER_BACKEND=mooncake (Mooncake).
-# RUN_MORI=1: uses mori IO (default).
-# ---------------------------------------------------------------------------
-RUN_FILE="sglang_disagg_mori_io_ep.sh"
-_run_mori="${RUN_MORI:-0}"
-if [[ "$_run_mori" == "1" ]]; then
-    echo "RUN_MORI=1: using $RUN_FILE with MoRI IO for model '$MODEL_NAME'"
-else
-    export KV_TRANSFER_BACKEND="mooncake"
-    echo "RUN_MORI=0: using $RUN_FILE with Mooncake (KV_TRANSFER_BACKEND=mooncake)"
-fi
-if [[ ! -f "$RUN_FILE" ]]; then
-    echo "Error: '$RUN_FILE' not found in $(pwd)." >&2
-    exit 1
-fi
-
-if test -z "${DOCKER_IMAGE_NAME:-}"; then
-  echo "Error: DOCKER_IMAGE_NAME is not set. Pass it via env before sbatch."
-  exit 1
-fi
-
-# Set current directory to be REPO directory with all relevant scripts
-export MOONCAKE_REPO_DIR=$(pwd)
-LOG_PATH="${LOG_PATH:-/shared_inference/${USER}/model_blog_logs}"
-
-xP="${xP:-1}" #-> Number of Prefill Servers
-yD="${yD:-1}" #-> Number of Decode Servers
-DP_MODE="${DP_MODE:-0}" #-> mori_io_ep: 1=dp flags + --dp-size/--ep-size; 0=tp flags, omit dp/ep CLI flags
-
-# xP>1 or yD>1 with DP_MODE=0: each node runs an independent TP server; proxy registers all IPs.
-# sglang_disagg_mori_io_ep.sh (RUN_MORI=1): set to 1 to skip phases; pass from wrapper before sbatch
-SKIP_BENCHMARK="${SKIP_BENCHMARK:-0}"
-SKIP_CURL_TEST="${SKIP_CURL_TEST:-0}"
-
-# Benchmark script selector: BENCHMARK_SCRIPT tag -> file run by the launcher.
-#   sweep   (default) -> benchmark_xPyD.sh    (random ISL/OSL concurrency sweep)
-#   agentic           -> benchmark_agentic.sh (aiperf agentic trace replay)
-# The in-container launcher (sglang_disagg_mori_io_ep.sh) auto-enables server
-# metrics + radix prefix cache when BENCHMARK_SCRIPT=agentic.
-BENCHMARK_SCRIPT="${BENCHMARK_SCRIPT:-sweep}"
-case "$BENCHMARK_SCRIPT" in
-  sweep)   BENCHMARK_SCRIPT_FILE="benchmark_xPyD.sh" ;;
-  agentic) BENCHMARK_SCRIPT_FILE="benchmark_agentic.sh" ;;
-  *) echo "Error: invalid BENCHMARK_SCRIPT='$BENCHMARK_SCRIPT' (valid: sweep, agentic)" >&2; exit 1 ;;
-esac
-export BENCHMARK_SCRIPT BENCHMARK_SCRIPT_FILE
-echo "BENCHMARK_SCRIPT='$BENCHMARK_SCRIPT' -> $BENCHMARK_SCRIPT_FILE"
-
-MODEL_NAME="${MODEL_NAME:-None}"
-MODEL_DIR="${MODEL_DIR:-"/shared_inference/models_blog/"}"
-
-validate_model_name() {
-  local is_valid_model=false
-
-  for model in "${VALID_MODELS[@]}"; do
-    if [[ "$MODEL_NAME" == "$model" ]]; then
-      is_valid_model=true
-      break
-    fi
-  done
-
-  if ! $is_valid_model; then
-    printf "Error: Invalid MODEL_NAME: '%s'\nValid models are:\n" "$MODEL_NAME"
-    for model in "${VALID_MODELS[@]}"; do
-      printf "  - %s\n" "$model"
-    done
-    exit 1
-  fi
-
-  echo "MODEL_NAME '$MODEL_NAME' is valid."
-  return 0
-}
-
-validate_model_name "${MODEL_NAME}"
-
-# ------------------------
-# Model path validation and selection across all nodes
-# ------------------------
-ORIGINAL_MODEL_PATH="/shared_inference/models_blog/${MODEL_NAME}"
-
-echo "Looking for model: $MODEL_NAME"
-echo "Checking model availability across all allocated nodes..."
-
-# Get all allocated nodes
-ALL_NODES=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-TOTAL_NODES=$(echo "$ALL_NODES" | wc -l)
-
-echo "Total allocated nodes: $TOTAL_NODES"
-echo "Nodes: $(echo "$ALL_NODES" | tr '\n' ' ')"
-
-# Function to check model path on all nodes
-check_model_path() {
-    local path=$1
-    local check_name=$2
-    
-    echo "Checking $check_name: $path"
-    
-    # Run check on all nodes in parallel
-    srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES /bin/bash -c "
-        if [ -d '$path' ]; then 
-            echo \"\$(hostname): ✓ Found $path\"
-            exit 0
-        else 
-            echo \"\$(hostname): ✗ Missing $path\"
-            exit 1
+# sbatch runs a spooled copy of this file, so BASH_SOURCE may not point at the recipe.
+resolve_recipe_dir() {
+    local dir cmd
+    cmd="$(scontrol show job "${SLURM_JOB_ID:-}" -o 2>/dev/null | sed -n 's/.* Command=\([^ ]*\).*/\1/p')"
+    for dir in "$(dirname "${BASH_SOURCE[0]}")" "${cmd:+$(dirname "${cmd}")}" \
+               "${SLURM_SUBMIT_DIR:-.}" "${SLURM_SUBMIT_DIR:-.}/scripts/sglang_disagg"; do
+        if [[ -n "${dir}" && -f "${dir}/launch.sh" && -f "${dir}/render.py" ]]; then
+            (cd "${dir}" && pwd)
+            return 0
         fi
-    "
-    
-    # Check if all nodes succeeded (exit code 0)
-    local exit_code=$?
-    if [ $exit_code -eq 0 ]; then
-        echo "✓ $check_name available on ALL nodes"
-        return 0
-    else
-        echo "✗ $check_name NOT available on all nodes"
-        return 1
-    fi
+    done
+    return 1
 }
+RECIPE_DIR="$(resolve_recipe_dir)" || die "cannot find the sglang_disagg recipe directory; run from scripts/sglang_disagg"
+SCRIPTS_DIR="$(dirname "${RECIPE_DIR}")"
 
-# Check /mnt/m2m_nobackup/models_blog first
-MODEL_PATH_1="/mnt/m2m_nobackup/models_blog/$MODEL_NAME"
-if check_model_path "$MODEL_PATH_1" "/mnt/m2m_nobackup/models_blog"; then
-    MODEL_PATH="$MODEL_PATH_1"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-# Check /shared_inference/models_blog
-elif check_model_path "/shared_inference/models_blog/$MODEL_NAME" "/shared_inference/models_blog"; then
-    MODEL_PATH="/shared_inference/models_blog/$MODEL_NAME"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-elif check_model_path "$MODEL_DIR/$MODEL_NAME" "$MODEL_DIR"; then
-    MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
-    echo ""
-    echo "✓ Selected MODEL_PATH: $MODEL_PATH (available on all nodes)"
-else
-    echo ""
-    echo "✗ FATAL ERROR: Model '$MODEL_NAME' not found on ALL allocated nodes in either:"
-    echo "  - /mnt/m2m_nobackup/models_blog/$MODEL_NAME"
-    echo "  - /shared_inference/models_blog/$MODEL_NAME"
-    echo ""
-    echo "Model must be accessible from all nodes for distributed execution."
-    echo "Please ensure the model is available on all allocated nodes."
-    exit 1
-fi
+# shellcheck source=settings.sh
+source "${RECIPE_DIR}/settings.sh"
+load_cluster_profile "${RECIPE_DIR}" || exit 1
 
-echo "Final MODEL_PATH: $MODEL_PATH"
-echo ""
+[[ -n "${DOCKER_IMAGE_NAME:-}" ]] || die "DOCKER_IMAGE_NAME is not set"
+[[ -n "${MODEL_NAME:-}" ]] || die "MODEL_NAME is not set"
+[[ -n "${SLURM_JOB_ID:-}" ]] || die "not inside a Slurm job; use sbatch, or bash within salloc"
 
+echo "=== sglang_disagg job ${SLURM_JOB_ID}: model=${MODEL_NAME} mode=${PARALLEL_MODE}" \
+     "backend=${KV_TRANSFER_BACKEND} xP=${xP} yD=${yD} cluster=${CLUSTER} benchmark=${BENCHMARK_SCRIPT}"
+echo "=== image: ${DOCKER_IMAGE_NAME}"
+echo "=== recipe: ${RECIPE_DIR}"
 
-# Calculate NUM_NODES based on xP and yD
-# The proxy/router runs on the first prefill node (NODE_RANK=0), so no extra node is needed.
-NUM_NODES=$((xP + yD))
-echo "Calculated NUM_NODES: $NUM_NODES (xP=$xP + yD=$yD) DP_MODE=$DP_MODE"
+# --- Nodes and their addresses ----------------------------------------------
+NEEDED=$(( xP + yD + DEDICATED_ROUTER ))
+mapfile -t ALL_NODES < <(scontrol show hostnames "${SLURM_JOB_NODELIST}")
+(( ${#ALL_NODES[@]} >= NEEDED )) \
+    || die "need ${NEEDED} nodes (xP=${xP} + yD=${yD} + router=${DEDICATED_ROUTER}) but the job has ${#ALL_NODES[@]}"
+NODES=("${ALL_NODES[@]:0:NEEDED}")
+NODELIST="$(IFS=,; echo "${NODES[*]}")"
+STEP=(--nodelist="${NODELIST}" --nodes="${NEEDED}" --ntasks="${NEEDED}" --ntasks-per-node=1)
 
-# ------------------------
-# Extract NUM_NODES from SLURM allocation and select nodes
-# ------------------------
-echo "Original SLURM allocation:"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: $SLURM_NNODES"
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-
-FULL_NODELIST=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-AVAILABLE_COUNT=$(echo "$FULL_NODELIST" | wc -l)
-
-if (( AVAILABLE_COUNT < NUM_NODES )); then
-    echo "ERROR: Need ${NUM_NODES} nodes (xP=${xP} + yD=${yD}) but only ${AVAILABLE_COUNT} allocated." >&2
-    exit 1
-fi
-
-# Pick the first NUM_NODES nodes from the allocation and sort alphabetically.
-# srun assigns PROCID=0 to the alphabetically-first hostname regardless of --nodelist order.
-# IPADDRS[0..xP-1] = prefill, IPADDRS[xP..] = decode, so the sorted order must match.
-SELECTED_NODES=$(echo "$FULL_NODELIST" | head -n "$NUM_NODES" | sort)
-SELECTED_NODELIST_STR=$(echo "$SELECTED_NODES" | tr '\n' ',' | sed 's/,$//')
-
-# Create new nodelist in SLURM format
-# This is a simplified approach - for complex ranges, you might need more sophisticated parsing
-NEW_SLURM_NODELIST=$(echo "$SELECTED_NODES" | paste -sd, | sed 's/,/,/g')
-
-# Update SLURM environment variables
-export SLURM_NNODES=$NUM_NODES
-export SLURM_NTASKS=$NUM_NODES
-export SLURM_JOB_NUM_NODES=$NUM_NODES
-export SLURM_NPROCS=$NUM_NODES
-export SLURM_JOB_NODELIST="$NEW_SLURM_NODELIST"
-export SLURM_NODELIST="$NEW_SLURM_NODELIST"
-
-# Keep other SLURM variables as they were or set defaults
-export SLURM_TASKS_PER_NODE="1(x$NUM_NODES)"
-export SLURM_SUBMIT_DIR="${SLURM_SUBMIT_DIR:-/home/ravgupta}"
-export SLURM_CLUSTER_NAME="${SLURM_CLUSTER_NAME:-m2m}"
-export SLURM_JOB_CPUS_PER_NODE="${SLURM_JOB_CPUS_PER_NODE}"
-export SLURM_JOB_PARTITION="${SLURM_JOB_PARTITION:-amd-rccl}"
-export SLURM_JOBID="${SLURM_JOBID:-$SLURM_JOB_ID}"
-export SLURM_JOB_QOS="${SLURM_JOB_QOS:-normal}"
-export SLURM_JOB_ACCOUNT="${SLURM_JOB_ACCOUNT:-amd-rccl}"
-export SLURM_NTASKS_PER_NODE=1
-export SLURM_SUBMIT_HOST="${SLURM_SUBMIT_HOST}"
-export SLURM_JOB_ID="${SLURM_JOB_ID}"
-export SLURM_CONF="${SLURM_CONF:-/etc/slurm/slurm.conf}"
-export SLURM_JOB_NAME="${SLURM_JOB_NAME:-${xP}p${yD}d_bench-serving}"
-
-echo ""
-echo "Updated SLURM Environment Variables:"
-echo "SLURM_JOB_ID: $SLURM_JOB_ID"
-echo "SLURM_JOB_NODELIST: $SLURM_JOB_NODELIST"
-echo "SLURM_NNODES: $SLURM_NNODES"
-echo "SLURM_NTASKS: $SLURM_NTASKS"
-echo "SLURM_TASKS_PER_NODE: $SLURM_TASKS_PER_NODE"
-echo "SLURM_JOB_CPUS_PER_NODE: $SLURM_JOB_CPUS_PER_NODE"
-echo "SLURM_JOB_PARTITION: $SLURM_JOB_PARTITION"
-echo "SLURM_JOB_NUM_NODES: $SLURM_JOB_NUM_NODES"
-echo "SLURM_JOBID: $SLURM_JOBID"
-echo "SLURM_JOB_QOS: $SLURM_JOB_QOS"
-echo "SLURM_NODELIST: $SLURM_NODELIST"
-echo "SLURM_JOB_ACCOUNT: $SLURM_JOB_ACCOUNT"
-echo "SLURM_NPROCS: $SLURM_NPROCS"
-echo "SLURM_SUBMIT_HOST: $SLURM_SUBMIT_HOST"
-echo "SLURM_CONF: $SLURM_CONF"
-echo "SLURM_JOB_NAME: $SLURM_JOB_NAME"
-echo "SLURM_NTASKS_PER_NODE: $SLURM_NTASKS_PER_NODE"
-echo "SLURM_SUBMIT_DIR: $SLURM_SUBMIT_DIR"
-echo "SLURM_CLUSTER_NAME: $SLURM_CLUSTER_NAME"
-echo "ulimit: $(ulimit -a)"
-echo ""
-echo "Selected nodes for execution:"
-echo "$SELECTED_NODES"
-echo ""
-
-# Node information
-USER_NAME=$(whoami)
-MASTER_NODE=$(echo "$SELECTED_NODES" | head -n 1)
-MASTER_ADDR=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$MASTER_NODE" bash -c 'hostname -I')
-# Prefer the fabric-subnet IP: nodes are multi-homed and picking the first
-# hostname -I address can land on a different subnet, which hangs the socket
-# barrier on mixed-subnet coordination. The preferred subnet prefix is
-# overridable via FABRIC_SUBNET_PREFIX (default "10.158." for the OCI
-# useocpm2m fabric); setting it empty is not intended (an empty prefix would
-# match every address), so when it is empty we skip the prefix match and go
-# straight to the first-address fallback. Fall back to the first address if no
-# matching address is present; fail fast if empty.
-FABRIC_SUBNET_PREFIX="${FABRIC_SUBNET_PREFIX:-10.158.}"
-# Escape regex-special chars so the prefix is matched literally, anchored at start.
-FABRIC_SUBNET_RE="^$(printf '%s' "$FABRIC_SUBNET_PREFIX" | sed 's/[.[\*^$]/\\&/g')"
-MASTER_ADDR_RAW="$MASTER_ADDR"
-if [ -n "$FABRIC_SUBNET_PREFIX" ]; then
-    MASTER_ADDR=$(echo "$MASTER_ADDR_RAW" | tr ' ' '\n' | grep -E "$FABRIC_SUBNET_RE" | head -1)
-else
-    MASTER_ADDR=""
-fi
-if [ -z "$MASTER_ADDR" ]; then
-    MASTER_ADDR=$(echo "$MASTER_ADDR_RAW" | awk '{print $1}')
-fi
-if [ -z "$MASTER_ADDR" ]; then
-    echo "ERROR: could not resolve MASTER_ADDR for node '$MASTER_NODE' from 'hostname -I' output: '$MASTER_ADDR_RAW'" >&2
-    exit 1
-fi
-MASTER_PORT=39566  # Choose an open port
-
+# Each node's address on FABRIC_SUBNET if it has one, else its first non-loopback
+# IPv4 address, in node order.
 IPS=()
+addrs="$(srun "${STEP[@]}" bash -c 'echo "$(hostname -s) $(hostname -I)"')" || die "could not query node addresses"
+for node in "${NODES[@]}"; do
+    read -ra cands <<< "$(awk -v n="${node%%.*}" '$1 == n {$1 = ""; print}' <<< "${addrs}")"
+    pick=""
+    if [[ -n "${FABRIC_SUBNET}" ]]; then
+        for a in "${cands[@]}"; do [[ "${a}" == "${FABRIC_SUBNET}"* ]] && { pick="${a}"; break; }; done
+    fi
+    if [[ -z "${pick}" ]]; then
+        for a in "${cands[@]}"; do [[ "${a}" != 127.* && "${a}" != *:* ]] && { pick="${a}"; break; }; done
+    fi
+    [[ -n "${pick}" ]] || die "no usable address for ${node} (hostname -I: ${cands[*]:-none})"
+    IPS+=("${pick}")
+done
+IPADDRS="$(IFS=,; echo "${IPS[*]}")"
+SELECTED_NODES="${NODELIST}"
+export IPADDRS SELECTED_NODES
+echo "=== nodes: ${NODELIST}"
+echo "=== addresses: ${IPADDRS}"
 
-for NODE in $SELECTED_NODES; do
-    IP=$(srun --nodes=1 --ntasks=1 --time=00:20:00 --nodelist="$NODE" bash -c 'hostname -I')
-    IP_RAW="$IP"
-    if [ -n "$FABRIC_SUBNET_PREFIX" ]; then
-        IP=$(echo "$IP_RAW" | tr ' ' '\n' | grep -E "$FABRIC_SUBNET_RE" | head -1)
-    else
-        IP=""
-    fi
-    if [ -z "$IP" ]; then
-        IP=$(echo "$IP_RAW" | awk '{print $1}')
-    fi
-    if [ -z "$IP" ]; then
-        echo "ERROR: could not resolve IP for node '$NODE' from 'hostname -I' output: '$IP_RAW'" >&2
+# --- Weights: the first <root>/<MODEL_NAME> present on every node -------------
+if [[ -z "${MODEL_PATH:-}" ]]; then
+    IFS=: read -ra roots <<< "${MODEL_ROOTS}"
+    candidates=("${roots[@]/%//${MODEL_NAME}}")
+    for c in "${candidates[@]}"; do
+        if srun "${STEP[@]}" test -d "${c}" 2>/dev/null; then MODEL_PATH="${c}"; break; fi
+    done
+    if [[ -z "${MODEL_PATH:-}" ]]; then
+        echo "ERROR: ${MODEL_NAME} is not on every node (\`python3 render.py models\` lists the catalog;" \
+             "set MODEL_PATH or MODEL_ROOTS for other locations). Per node:" >&2
+        # shellcheck disable=SC2016
+        srun "${STEP[@]}" bash -c 'for c in "$@"; do [[ -d "$c" ]] && s=found || s=missing; echo "  $(hostname -s): ${s} ${c}"; done' \
+            _ "${candidates[@]}" 2>/dev/null | sort >&2
         exit 1
     fi
-    IPS+=("$IP")
-done
-
-echo "Selected node IPs: ${IPS[*]}" | sed 's/ /,/g'
-
-MOONCAKE_COOKBOOK_PATH="/opt/mooncake-cookbook"
-BENCHMARK_FILE="${BENCHMARK_FILE:-$MOONCAKE_COOKBOOK_PATH/disagg_blog_p1/models_blog/run_xPyD_models.slurm}"
-timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
-
-NNODES=$NUM_NODES
-
-echo "MASTER_NODE is ${MASTER_NODE}"
-echo "MASTER_ADDR is ${MASTER_ADDR}"
-echo "MASTER_PORT is ${MASTER_PORT}"
-echo "NNODES is ${NNODES}"
-echo "REPO Directory is ${MOONCAKE_REPO_DIR}"
-echo "SKIP_BENCHMARK=${SKIP_BENCHMARK} SKIP_CURL_TEST=${SKIP_CURL_TEST} (sglang_disagg_mori_io_ep.sh NODE_RANK=0)"
-
-if [ ! -d "$LOG_PATH" ]; then
-    mkdir -p "$LOG_PATH"
-    echo "Created directory: $LOG_PATH"
-else
-    echo "Directory already exists: $LOG_PATH"
 fi
+export MODEL_PATH
+echo "=== weights: ${MODEL_PATH}"
 
-export LOG_PATH=$LOG_PATH
-export MOONCAKE_REPO_DIR=$MOONCAKE_REPO_DIR
-export MOONCAKE_COOKBOOK_PATH=$MOONCAKE_COOKBOOK_PATH
-export NNODES=$NNODES
-export MASTER_ADDR=$MASTER_ADDR
-export MASTER_PORT=$MASTER_PORT
-export MODEL_PATH=$MODEL_PATH
-export xP=$xP
-export yD=$yD
-export DP_MODE=$DP_MODE
-export MODEL_NAME=$MODEL_NAME
-export USER_NAME=$USER_NAME
-export IPADDRS="$(echo "${IPS[*]}" | sed 's/ /,/g')"
-export BENCHMARK_ITR=${BENCHMARK_ITR:-2}
-export SKIP_BENCHMARK
-export SKIP_CURL_TEST
+RUN_LOG_DIR="${LOG_ROOT}/${SLURM_JOB_ID}"
+mkdir -p "${RUN_LOG_DIR}" || die "cannot create ${RUN_LOG_DIR}"
+echo "=== logs: ${RUN_LOG_DIR}"
 
-export DOCKER_CONT_NAME="container_${MODEL_NAME}_${SLURM_JOB_ID}"
-export RUN_FILE_FULL="$MOONCAKE_COOKBOOK_PATH/${RUN_FILE}"
+# --- Containers ---------------------------------------------------------------
+# Forwarded by name only (docker run -e NAME), so values such as tokens are
+# never written to disk.
+[[ -n "${AGENTIC_CONFIG:-}" ]] && AGENTIC_CONFIG="${AGENTIC_CONFIG//\$HOME/${HOME}}" && export AGENTIC_CONFIG
+FORWARD_RE='^(MODEL_NAME|MODEL_PATH|xP|yD|IPADDRS|PARALLEL_MODE|KV_TRANSFER_BACKEND|BENCHMARK_SCRIPT'
+FORWARD_RE+='|CLUSTER|SERVER_PORT|ROUTER_PORT|DIST_INIT_PORT|GPUS_PER_NODE|PREFILL_TP_SIZE|DECODE_TP_SIZE'
+FORWARD_RE+='|KV_IB_DEVICES|USE_CX7_NICS|EXTRA_(SERVER|PREFILL|DECODE|ROUTER)_ARGS'
+FORWARD_RE+='|ENABLE_RADIX_CACHE|ENABLE_SERVER_METRICS|WORKER_STARTUP_TIMEOUT|SKIP_CURL_TEST'
+FORWARD_RE+='|DOCKER_IMAGE_NAME|SELECTED_NODES|SLURM_JOB_ID|SLURM_JOB_NODELIST'
+FORWARD_RE+='|DURATION|MAX_MODEL_LEN|MODEL_PREFIX|HF_HOME|HF_TOKEN|DRY_RUN)$'
+FORWARD_RE+='|^(NCCL|RCCL|MORI|SGLANG|HSA|HIP|GLOO|TORCH|AGENTIC|AIPERF|SUITE|BENCHMARK|WEKA|MAD)_'
+FORWARD_NAMES="$(compgen -e | grep -E "${FORWARD_RE}" | xargs)"
+CONTAINER_NAME="sglang_disagg_${SLURM_JOB_ID}"
+export FORWARD_NAMES CONTAINER_NAME RUN_LOG_DIR SCRIPTS_DIR
 
-# AGENTIC_CONFIG may use $HOME (e.g. from models.json); expand at submit time.
-[ -n "${AGENTIC_CONFIG:-}" ] && AGENTIC_CONFIG="$(eval echo "$AGENTIC_CONFIG")"
+cleanup_containers() {
+    srun "${STEP[@]}" bash -c 'docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1; true' >/dev/null 2>&1
+}
+trap cleanup_containers EXIT
 
-# Use only the selected nodes for srun execution
-SELECTED_NODELIST_SRUN=$(echo "$SELECTED_NODES" | paste -sd,)
-
-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c '
-echo "Rank $SLURM_PROCID on $(hostname)";
-docker ps -q | xargs --no-run-if-empty docker stop;
-docker run --rm \
-    --device /dev/dri \
-    --device /dev/kfd \
-    --device /dev/infiniband \
-    --network host \
-    --ipc host \
-    --group-add video \
-    --cap-add SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    --privileged \
-    -v $HOME:$HOME \
-    -v /shared_inference:/shared_inference \
-    -v /mnt/m2m_nobackup:/mnt/m2m_nobackup \
-    -v $HOME/.ssh:/root/.ssh \
-    --shm-size 64G \
-    -v ${LOG_PATH}:/run_logs \
-    -v $MOONCAKE_REPO_DIR:$MOONCAKE_COOKBOOK_PATH \
-    -e SLURM_JOB_ID=$SLURM_JOB_ID \
-    -e SLURM_JOB_NODELIST=$SLURM_JOB_NODELIST \
-    -e NNODES=$NNODES \
-    -e NODE_RANK=$SLURM_PROCID \
-    -e MASTER_ADDR=$MASTER_ADDR \
-    -e MASTER_PORT=$MASTER_PORT \
-    -e MODEL_PATH=$MODEL_PATH \
-    -e MOONCAKE_COOKBOOK_PATH=$MOONCAKE_COOKBOOK_PATH \
-    -e xP=$xP \
-    -e yD=$yD \
-    -e DP_MODE=$DP_MODE \
-    -e USER_NAME=$USER_NAME \
-    -e MODEL_NAME=$MODEL_NAME \
-    -e BENCHMARK_FILE=$BENCHMARK_FILE \
-    -e IPADDRS=$IPADDRS \
-    -e BENCHMARK_ITR=$BENCHMARK_ITR \
-    -e SKIP_BENCHMARK=$SKIP_BENCHMARK \
-    -e SKIP_CURL_TEST=$SKIP_CURL_TEST \
-    ${KV_TRANSFER_BACKEND:+-e KV_TRANSFER_BACKEND=$KV_TRANSFER_BACKEND} \
-    -e BENCHMARK_COMBINATIONS="${BENCHMARK_COMBINATIONS:-1024/1024 8192/1024}" \
-    -e DOCKER_IMAGE_NAME=${DOCKER_IMAGE_NAME:-unknown} \
-    -e USE_CX7_NICS=${USE_CX7_NICS:-0} \
-    ${BENCHMARK_SCRIPT:+-e BENCHMARK_SCRIPT=$BENCHMARK_SCRIPT} \
-    ${BENCHMARK_SCRIPT_FILE:+-e BENCHMARK_SCRIPT_FILE=$BENCHMARK_SCRIPT_FILE} \
-    -e MOONCAKE_REPO_DIR="$MOONCAKE_REPO_DIR" \
-    ${AGENTIC_CONC:+-e AGENTIC_CONC=$AGENTIC_CONC} \
-    ${DURATION:+-e DURATION=$DURATION} \
-    ${AGENTIC_PORT:+-e AGENTIC_PORT=$AGENTIC_PORT} \
-    ${MODEL_PREFIX:+-e MODEL_PREFIX=$MODEL_PREFIX} \
-    ${WEKA_LOADER_OVERRIDE:+-e WEKA_LOADER_OVERRIDE=$WEKA_LOADER_OVERRIDE} \
-    ${AIPERF_UNSAFE_OVERRIDE:+-e AIPERF_UNSAFE_OVERRIDE=$AIPERF_UNSAFE_OVERRIDE} \
-    ${AGENTIC_CACHE_WARMUP_DURATION:+-e AGENTIC_CACHE_WARMUP_DURATION=$AGENTIC_CACHE_WARMUP_DURATION} \
-    ${MAX_MODEL_LEN:+-e MAX_MODEL_LEN=$MAX_MODEL_LEN} \
-    ${AGENTIC_CONFIG:+-e AGENTIC_CONFIG=$AGENTIC_CONFIG} \
-    ${AGENTIC_WORKLOAD:+-e AGENTIC_WORKLOAD=$AGENTIC_WORKLOAD} \
-    ${SUITE_CORPUS_DIR:+-e SUITE_CORPUS_DIR=$SUITE_CORPUS_DIR} \
-    ${AIPERF_PIN:+-e AIPERF_PIN=$AIPERF_PIN} \
-    ${AGENTIC_UTILS_PIN:+-e AGENTIC_UTILS_PIN=$AGENTIC_UTILS_PIN} \
-    ${SUITE_CORPUS_FORCE:+-e SUITE_CORPUS_FORCE=$SUITE_CORPUS_FORCE} \
-    ${AGENTIC_STRICT_CONTEXT:+-e AGENTIC_STRICT_CONTEXT=$AGENTIC_STRICT_CONTEXT} \
-    ${AGENTIC_HF_ISL_TAIL:+-e AGENTIC_HF_ISL_TAIL=$AGENTIC_HF_ISL_TAIL} \
-    ${HF_HOME:+-e HF_HOME=$HF_HOME} \
-    ${ENABLE_SERVER_METRICS:+-e ENABLE_SERVER_METRICS=$ENABLE_SERVER_METRICS} \
-    ${ENABLE_RADIX_CACHE:+-e ENABLE_RADIX_CACHE=$ENABLE_RADIX_CACHE} \
-    ${DRY_RUN:+-e DRY_RUN=$DRY_RUN} \
-    ${AGENTIC_ALLOW_UV_INSTALL:+-e AGENTIC_ALLOW_UV_INSTALL=$AGENTIC_ALLOW_UV_INSTALL} \
-    ${AGENTIC_UV_VERSION:+-e AGENTIC_UV_VERSION=$AGENTIC_UV_VERSION} \
-    --ulimit nofile=1048576:1048576 \
-    --name $DOCKER_CONT_NAME \
-    --entrypoint /bin/bash \
-    $DOCKER_IMAGE_NAME -c "
-        set -o pipefail
-        mkdir -p /run_logs/${SLURM_JOB_ID}
-        $RUN_FILE_FULL 2>&1 | tee /run_logs/${SLURM_JOB_ID}/pd_sglang_bench_serving.sh_NODE${SLURM_PROCID}.log
-    "
+# --kill-on-bad-exit: any node exiting non-zero (a server that died, a failed
+# benchmark) ends every node, instead of the rest waiting for the time limit.
+srun "${STEP[@]}" --kill-on-bad-exit=1 bash -c '
+    set -o pipefail
+    # Containers this recipe left behind on the node in an earlier job.
+    docker ps -aq --filter label=mad.recipe=sglang_disagg | xargs -r docker rm -f >/dev/null 2>&1
+    args=(--rm --name "${CONTAINER_NAME}" --label mad.recipe=sglang_disagg --label "mad.job=${SLURM_JOB_ID}"
+          --network host --ipc host --privileged --group-add video
+          --cap-add SYS_PTRACE --security-opt seccomp=unconfined
+          --device /dev/kfd --device /dev/dri --device /dev/infiniband
+          --shm-size 64G --ulimit nofile=1048576:1048576
+          -v "${SCRIPTS_DIR}:/opt/mad/scripts" -v "${LOG_ROOT}:/run_logs"
+          -v "${MODEL_PATH}:${MODEL_PATH}:ro" -v "${HOME}:${HOME}")
+    for m in ${EXTRA_MOUNTS}; do [[ -d "${m}" ]] && args+=(-v "${m}:${m}"); done
+    for name in ${FORWARD_NAMES}; do args+=(-e "${name}"); done
+    args+=(-e "NODE_RANK=${SLURM_PROCID}" -e "RUN_DIR=/run_logs/${SLURM_JOB_ID}")
+    docker run "${args[@]}" --entrypoint /bin/bash "${DOCKER_IMAGE_NAME}" \
+        /opt/mad/scripts/sglang_disagg/launch.sh 2>&1 | tee "${RUN_LOG_DIR}/launch_NODE${SLURM_PROCID}.log"
 '
-srun --nodelist="$SELECTED_NODELIST_SRUN" bash -c 'docker stop $DOCKER_CONT_NAME; docker rm -f $DOCKER_CONT_NAME'
-
+status=$?
+echo "=== exit status ${status}; logs: ${RUN_LOG_DIR}"
+exit "${status}"

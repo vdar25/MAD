@@ -23,7 +23,7 @@ a full template.
    any launcher repo-dir env var if the in-container mount hides `../common`, plus
    an `AGENTIC_LIB` override) and `exec bash "$_cand" --backend <backend> "$@"`.
    Copy an existing shim
-   ([sglang](../../../sglang_disagg/benchmark_agentic.sh),
+   ([sglang](../../../sglang_disagg/benchmarks/agentic.sh),
    [vllm](../../../vllm_dissag/benchmark_agentic.sh)).
 4. **Wire it into the launcher:** it is selected via
    `export BENCHMARK_SCRIPT_FILE=benchmark_agentic.sh` (typically exposed to users

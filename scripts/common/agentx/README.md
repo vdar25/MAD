@@ -90,7 +90,7 @@ The nine additions, one line each:
 5. **Tier 1 / Tier 2 separation** — Tier 1 (concurrency, num_dataset_entries, trajectory) steers replay; Tier 2 (max_isl, max_turns, sample) produces a cached subset corpus.
 6. **Model-agnostic context gating** — auto-detect served window from `/v1/models`, cap `--max-context-length` at `min(next_pow2(ISL tail), window)`, WARN/cap or SKIP under `AGENTIC_STRICT_CONTEXT=1`.
 7. **Preset inheritance** — ship a shape once in `profiles/<name>.yaml`, reference via `preset:`, override per entry; circular chains raise `ValueError`.
-8. **Backend-agnostic core** (`agentic_lib.sh`, ~480 lines) — speaks only the OpenAI API; a new backend is a thin (~60-line) hook. Currently integrated: SGLang disaggregated (`scripts/sglang_disagg/benchmark_agentic.sh`, port 2322); vLLM/TRT-LLM/TGI are future hooks.
+8. **Backend-agnostic core** (`agentic_lib.sh`, ~480 lines) — speaks only the OpenAI API; a new backend is a thin (~60-line) hook. Currently integrated: SGLang disaggregated (`scripts/sglang_disagg/benchmarks/agentic.sh`, port 2322); vLLM/TRT-LLM/TGI are future hooks.
 9. **DRY_RUN preview** — `DRY_RUN=1` prints the resolved plan and every assembled aiperf command with no server/download/replay.
 
 ## File map

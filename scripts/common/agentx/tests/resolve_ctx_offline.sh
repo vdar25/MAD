@@ -14,8 +14,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
 STUB="$HERE/_stub_server.py"
 
-if [ ! -f "$REPO_ROOT/scripts/sglang_disagg/benchmark_agentic.sh" ]; then
-    echo "could not locate repo root (missing scripts/sglang_disagg/benchmark_agentic.sh under $REPO_ROOT)" >&2
+if [ ! -f "$REPO_ROOT/scripts/sglang_disagg/benchmarks/agentic.sh" ]; then
+    echo "could not locate repo root (missing scripts/sglang_disagg/benchmarks/agentic.sh under $REPO_ROOT)" >&2
     exit 1
 fi
 
@@ -48,10 +48,9 @@ report() {  # $1=name  $2=0/1 pass
     if [ "$2" = "1" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fails=$((fails+1)); fi
 }
 
-run_backend() {  # $1=backend name  $2=backend dir under scripts/
+run_backend() {  # $1=backend name  $2=hook path under scripts/
     local bk="$1"
-    local dir="$2"
-    local HOOK="$REPO_ROOT/scripts/${dir}/benchmark_agentic.sh"
+    local HOOK="$REPO_ROOT/scripts/$2"
     local before=$fails
 
     if [ ! -f "$HOOK" ]; then
@@ -104,11 +103,11 @@ run_backend() {  # $1=backend name  $2=backend dir under scripts/
     echo "---- [$bk] summary: $([ "$bk_fails" -eq 0 ] && echo "ALL PASS" || echo "$bk_fails FAILED")"
 }
 
-# backend name -> its directory under scripts/ (note the vllm dir spelling).
-for pair in "sglang:sglang_disagg" "vllm:vllm_dissag"; do
-    bk="${pair%%:*}"; dir="${pair##*:}"
+# backend name -> its hook under scripts/ (note the vllm dir spelling).
+for pair in "sglang:sglang_disagg/benchmarks/agentic.sh" "vllm:vllm_dissag/benchmark_agentic.sh"; do
+    bk="${pair%%:*}"; hook="${pair##*:}"
     echo "=== backend: $bk ==="
-    run_backend "$bk" "$dir"
+    run_backend "$bk" "$hook"
     echo ""
 done
 

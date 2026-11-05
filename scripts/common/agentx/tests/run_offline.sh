@@ -34,7 +34,7 @@ trap cleanup EXIT
 echo "=== 1. bash -n syntax check (hooks + connectors + driver + lib) ==="
 SYNTAX_TARGETS=(
     "$COMMON_DIR/benchmark_agentic.sh"
-    "$REPO_ROOT/scripts/sglang_disagg/benchmark_agentic.sh"
+    "$REPO_ROOT/scripts/sglang_disagg/benchmarks/agentic.sh"
     "$REPO_ROOT/scripts/vllm_dissag/benchmark_agentic.sh"
     "$REPO_ROOT/scripts/vllm_dissag/connectors/rixl.sh"
     "$REPO_ROOT/scripts/vllm_dissag/connectors/moriio.sh"
@@ -308,7 +308,7 @@ else
 fi
 
 # 8.3 sglang launcher must expand $HOME in AGENTIC_CONFIG before docker forward.
-if grep -vE '^[[:space:]]*#' "$SLURM_LAUNCHER" | grep -q 'AGENTIC_CONFIG="\$(eval echo'; then
+if grep -vE '^[[:space:]]*#' "$SLURM_LAUNCHER" | grep -qF 'AGENTIC_CONFIG//\$HOME'; then
     _pass "sglang launcher: AGENTIC_CONFIG \$HOME expansion present"
 else
     _fail "sglang launcher: AGENTIC_CONFIG \$HOME expansion present"
