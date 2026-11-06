@@ -6,30 +6,6 @@
 _MORI_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="${_MORI_SCRIPT_DIR}"
 
-# -----------------------------------------------------------------------------
-# DP_MODE=1 allowlist (MoRI IO EP). Must stay in sync with run_xPyD_models.slurm.
-# -----------------------------------------------------------------------------
-MORI_DP_MODE1_ALLOWED_MODELS=(
-    "DeepSeek-V3"
-    "DeepSeek-R1"
-)
-
-mori_model_allows_dp_mode_one() {
-    local name="$1"
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        [[ "$name" == "$m" ]] && return 0
-    done
-    return 1
-}
-
-mori_dp_mode1_allowed_models_lines() {
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        printf '  - %s\n' "$m"
-    done
-}
-
 # =============================================================================
 # Environment Configuration
 # =============================================================================
@@ -46,26 +22,8 @@ xP="${xP:-1}"
 yD="${yD:-1}"
 DP_MODE="${DP_MODE:-0}"
 
-# PARALLEL_MODE is derived strictly from DP_MODE for models.yaml (tp vs dp flags).
-# NOTE: DP_MODE=1 with yD>1 (e.g. 1P2D) was previously limited due to a sglang
-# detokenizer deadlock (multi-node disaggregated decode, nnodes=2, dp=16).
-# That guard is now lifted to re-validate — DeepSeek-V3/R1 only.
-if [[ "$DP_MODE" == "1" ]]; then
-    PARALLEL_MODE=dp
-else
-    PARALLEL_MODE=tp
-fi
-echo "PARALLEL_MODE=${PARALLEL_MODE} (DP_MODE=${DP_MODE})"
-
 if [[ -z "${MODEL_NAME:-}" ]]; then
     echo "ERROR: MODEL_NAME not set, exiting"
-    exit 1
-fi
-
-if [[ "$DP_MODE" == "1" ]] && ! mori_model_allows_dp_mode_one "$MODEL_NAME"; then
-    echo "ERROR: DP_MODE=1 is not supported for model '${MODEL_NAME}'. Allowed models:" >&2
-    mori_dp_mode1_allowed_models_lines >&2
-    echo "Use DP_MODE=0 for other models." >&2
     exit 1
 fi
 
@@ -91,9 +49,9 @@ BARRIER_PORT="${BARRIER_PORT:-4342}"
 # between ===DRYRUN and ===END=== lines, as vllm_disagg.sh does -- and starts, installs,
 # waits for and writes nothing. For offline checks (scripts/common/tests/snapshot).
 _dry_run() { [[ "${DRY_RUN:-0}" == "1" ]]; }
-_dry_run_emit() {  # <role> <command string>
+_dry_run_emit() {  # <role> <argv...>
     echo "===DRYRUN role=$1 NODE_RANK=${NODE_RANK}==="
-    eval "set -- $2"
+    shift
     printf '%s\n' "$@"
     echo "===END==="
 }
@@ -217,207 +175,28 @@ _job_fail() {  # <reason>
     exit 1
 }
 
-if [[ "$PARALLEL_MODE" != "dp" && "$PARALLEL_MODE" != "tp" ]]; then
-    echo "ERROR: PARALLEL_MODE must be 'dp' or 'tp' (got: ${PARALLEL_MODE})"
-    exit 1
-fi
-
 # =============================================================================
-# Parallelism Settings
+# Server and router commands
 # =============================================================================
 
-# DP_MODE=0: CLI --tp-size is IO_EP_TP_SIZE (default 8) on every worker; PREFILL_EP_SIZE/DECODE_EP_SIZE
-# still scale with xP/yD×GPUS_PER_NODE for MoRI env (not passed as CLI unless DP_MODE=1).
-# DP_MODE=1: --tp-size scales with cluster; --dp-size/--ep-size on CLI (same total degree as Nnodes×GPUS_PER_NODE).
-GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
-GENERIC_TP_SIZE="${GENERIC_TP_SIZE:-8}"
+# NIC selection and the servers' NCCL / MoRI environment (connectors/mori.env).
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/mori_ep_env.sh"
 
-if [[ "$DP_MODE" == "1" ]]; then
-    PREFILL_TP_SIZE=$((xP * GPUS_PER_NODE))
-    DECODE_TP_SIZE=$((yD * GPUS_PER_NODE))
-else
-    PREFILL_TP_SIZE="${GENERIC_TP_SIZE}"
-    DECODE_TP_SIZE="${GENERIC_TP_SIZE}"
-fi
+# This node's role and commands, from models.yaml (render.py); the launcher's topology
+# (MAD_TOPO_*) decides the role. Sets ROLE, ROLE_INDEX, RUNS_SERVER, RUNS_ROUTER,
+# TP_SIZE, SERVER_ARGV, ROUTER_ARGV, IP_FIRST_PREFILL and IP_FIRST_DECODE.
+_render_out="$(HOST_IP="${host_ip}" python3 "${SCRIPT_DIR}/render.py" \
+    --models "${MODELS_YAML:-${SCRIPT_DIR}/models.yaml}" shell --rank "${NODE_RANK}")" \
+    || _job_fail "render.py could not build node ${NODE_RANK}'s commands (error above)"
+eval "${_render_out}"
+echo "Using model-specific configuration for: $MODEL_NAME (DP_MODE=${DP_MODE}, ${ROLE} ${ROLE_INDEX})"
 
-
-if [[ "$DP_MODE" == "1" ]]; then
-    PREFILL_EP_SIZE=$((xP * GPUS_PER_NODE))
-    DECODE_EP_SIZE=$((yD * GPUS_PER_NODE))
-    PREFILL_DP_SIZE=$((xP * GPUS_PER_NODE))
-    DECODE_DP_SIZE=$((yD * GPUS_PER_NODE))
-    export PREFILL_DP_SIZE DECODE_DP_SIZE PREFILL_EP_SIZE DECODE_EP_SIZE
-else
-    unset PREFILL_DP_SIZE DECODE_DP_SIZE PREFILL_EP_SIZE DECODE_EP_SIZE 2>/dev/null || true
-fi
-export PREFILL_TP_SIZE DECODE_TP_SIZE
-
-# =============================================================================
-# Model-Specific Configuration from YAML
-# =============================================================================
-
-MODELS_YAML="${MODELS_YAML:-${SCRIPT_DIR}/models.yaml}"
-
-if [[ ! -f "$MODELS_YAML" ]]; then
-    echo "ERROR: models.yaml not found at $MODELS_YAML"
-    exit 1
-fi
-
-export MODELS_YAML MODEL_NAME PARALLEL_MODE xP GPUS_PER_NODE
-eval "$(python3 - <<'PY'
-import os
-import re
-import shlex
-import sys
-import yaml
-
-config_path = os.environ["MODELS_YAML"]
-model_name = os.environ["MODEL_NAME"]
-mode = os.environ["PARALLEL_MODE"]
-xP = int(os.environ.get("xP", "1"))
-gpus_per_node = int(os.environ.get("GPUS_PER_NODE", "8"))
-
-with open(config_path, "r", encoding="utf-8") as f:
-    models = yaml.safe_load(f) or {}
-
-if model_name not in models:
-    print(f'echo "ERROR: Model {model_name} not found in {config_path}"; exit 1')
-    sys.exit(0)
-
-cfg = models[model_name] or {}
-prefill = cfg.get("prefill", {}) or {}
-decode = cfg.get("decode", {}) or {}
-
-
-def q(v):
-    return shlex.quote(str(v if v is not None else ""))
-
-
-prefill_flags = prefill.get(mode, "") or ""
-
-exports = {
-    "MODEL_BASE_FLAGS": cfg.get("base_flags", ""),
-    "MODEL_MODE_FLAGS": cfg.get(f"{mode}_flags", ""),
-    "MODEL_PREFILL_FLAGS": prefill_flags,
-    "MODEL_DECODE_FLAGS": decode.get(mode, ""),
-    "MODEL_EXPERIMENTAL_FLAGS": cfg.get("experimental_flags", ""),
-}
-
-for key, value in exports.items():
-    print(f"{key}={q(value)}")
-PY
-)"
-
-PREFILL_MODEL_CONFIG="${MODEL_BASE_FLAGS} ${MODEL_MODE_FLAGS} ${MODEL_PREFILL_FLAGS} ${MODEL_EXPERIMENTAL_FLAGS}"
-DECODE_MODEL_CONFIG="${MODEL_BASE_FLAGS} ${MODEL_MODE_FLAGS} ${MODEL_DECODE_FLAGS} ${MODEL_EXPERIMENTAL_FLAGS}"
-echo "Using model-specific configuration for: $MODEL_NAME (mode=${PARALLEL_MODE})"
-
-# Agentic gating: the default concurrency sweep keeps the perf-tuned config
-# (models.yaml base_flags, radix cache off). Only the agentic trace-replay path
-# (BENCHMARK_SCRIPT_FILE=benchmark_agentic.sh) — or an explicit override — turns
-# on the radix prefix cache and server-side Prometheus metrics. This keeps the
-# default path byte-for-byte unchanged.
+# The agentic replay reads server-side metrics; render.py adds the server flags.
 AGENTIC_METRICS_ENABLED=0
 if [[ "${BENCHMARK_SCRIPT:-}" == "agentic" || "${ENABLE_SERVER_METRICS:-0}" == "1" ]]; then
     AGENTIC_METRICS_ENABLED=1
 fi
-SERVER_METRICS_FLAGS=""
-if [[ "${AGENTIC_METRICS_ENABLED}" == "1" ]]; then
-    SERVER_METRICS_FLAGS="--enable-metrics --enable-metrics-for-all-schedulers"
-fi
-if [[ "${BENCHMARK_SCRIPT:-}" == "agentic" || "${ENABLE_RADIX_CACHE:-0}" == "1" ]]; then
-    PREFILL_MODEL_CONFIG="${PREFILL_MODEL_CONFIG//--disable-radix-cache/}"
-    DECODE_MODEL_CONFIG="${DECODE_MODEL_CONFIG//--disable-radix-cache/}"
-    echo "[radix] radix prefix cache ENABLED (stripped --disable-radix-cache) for agentic/ENABLE_RADIX_CACHE"
-fi
-
-export PREFILL_MODEL_CONFIG DECODE_MODEL_CONFIG MODEL_EXPERIMENTAL_FLAGS SERVER_METRICS_FLAGS
-
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/mori_ep_env.sh"
-
-# Recipe flags adapted to the installed sglang (removed and renamed options); see
-# sglang_compat.sh.
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/sglang_compat.sh"
-_SGL_PRR_FLAG="$(sgl_prr_flag)"
-PREFILL_MODEL_CONFIG="$(sgl_compat_flags "${PREFILL_MODEL_CONFIG}")"
-DECODE_MODEL_CONFIG="$(sgl_compat_flags "${DECODE_MODEL_CONFIG}")"
-export PREFILL_MODEL_CONFIG DECODE_MODEL_CONFIG
-
-# KV transfer backend: default mori, switchable to mooncake (Mooncake).
-# Kept out of models.yaml so model config is backend-agnostic.
-_TRANSFER_BACKEND="${KV_TRANSFER_BACKEND:-mori}"
-PREFILL_MODEL_CONFIG+=" --disaggregation-transfer-backend ${_TRANSFER_BACKEND}"
-DECODE_MODEL_CONFIG+=" --disaggregation-transfer-backend ${_TRANSFER_BACKEND}"
-export PREFILL_MODEL_CONFIG DECODE_MODEL_CONFIG
-
-if [[ "${_TRANSFER_BACKEND}" != "mori" ]]; then
-    echo "[override] Transfer backend: ${_TRANSFER_BACKEND}"
-fi
-
-
-# =============================================================================
-# Cluster Topology (dist-init endpoints)
-# =============================================================================
-
-# Proxy/router runs on NODE_RANK=0 (first prefill node); no extra proxy node needed.
-# IP layout: IP_ARRAY[0..xP-1] = prefill nodes, IP_ARRAY[xP..xP+yD-1] = decode nodes.
-IP_FIRST_PREFILL=$(echo "$IPADDRS" | awk -F',' '{print $1}')
-IP_FIRST_DECODE=$(echo "$IPADDRS" | awk -F',' -v pos="$xP" '{print $(pos+1)}')
-
-IFS=',' read -ra IP_ARRAY <<< "$IPADDRS"
-
-DIST_INIT_PORT="${DIST_INIT_PORT:-5757}"
-PREFILL_NNODES="${xP}"
-DECODE_NNODES="${yD}"
-PREFILL_DIST_INIT_ADDR="${IP_FIRST_PREFILL}:${DIST_INIT_PORT}"
-DECODE_DIST_INIT_ADDR="${IP_FIRST_DECODE}:${DIST_INIT_PORT}"
-
-if [[ "$DP_MODE" == "1" ]]; then
-    _expected_ip_slots=$((xP + yD))
-    if [[ -z "$IP_FIRST_PREFILL" || -z "$IP_FIRST_DECODE" ]]; then
-        echo "ERROR: DP_MODE=1 requires non-empty IP_FIRST_PREFILL and IP_FIRST_DECODE (from IPADDRS=${IPADDRS})" >&2
-        exit 1
-    fi
-    if ((${#IP_ARRAY[@]} < _expected_ip_slots)); then
-        echo "ERROR: DP_MODE=1 expects at least ${_expected_ip_slots} comma-separated hosts in IPADDRS (xP=${xP} prefill + yD=${yD} decode); got ${#IP_ARRAY[@]}" >&2
-        exit 1
-    fi
-    echo "[debug] DP_MODE=1 topology:"
-    echo "[debug]   xP=${xP} yD=${yD} GPUS_PER_NODE=${GPUS_PER_NODE}"
-    echo "[debug]   PREFILL_TP_SIZE=${PREFILL_TP_SIZE}  PREFILL_DP_SIZE=${PREFILL_DP_SIZE}  PREFILL_EP_SIZE=${PREFILL_EP_SIZE}  PREFILL_NNODES=${PREFILL_NNODES}"
-    echo "[debug]   DECODE_TP_SIZE=${DECODE_TP_SIZE}  DECODE_DP_SIZE=${DECODE_DP_SIZE}  DECODE_EP_SIZE=${DECODE_EP_SIZE}  DECODE_NNODES=${DECODE_NNODES}"
-    echo "[debug]   PREFILL_DIST_INIT_ADDR=${PREFILL_DIST_INIT_ADDR}"
-    echo "[debug]   DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR}"
-    echo "[debug]   IP_FIRST_PREFILL=${IP_FIRST_PREFILL}  IP_FIRST_DECODE=${IP_FIRST_DECODE}"
-    echo "[debug]   MORI_SHMEM_HEAP_SIZE=${MORI_SHMEM_HEAP_SIZE}"
-fi
-
-PREFILL_ARGS=""
-DECODE_ARGS=""
-
-# Router backend URLs:
-# DP_MODE=0: each node is an independent HTTP worker → register all xP prefill and all yD decode nodes.
-# DP_MODE=1: only the master node (NODE_RANK=0 for prefill, NODE_RANK=xP for decode) exposes an HTTP
-#   server; secondary nodes are pure compute workers with a dummy health-check placeholder on port 3000
-#   that returns 404 on all real endpoints. Registering secondary nodes causes the proxy to mark them
-#   unhealthy and skip all traffic, so only the master IPs are registered.
-if [[ "$DP_MODE" == "1" ]]; then
-    PREFILL_ARGS=" --prefill http://${IP_ARRAY[0]}:3000"
-    DECODE_ARGS=" --decode http://${IP_ARRAY[$xP]}:3000"
-else
-    for ((i=0; i<xP && i<${#IP_ARRAY[@]}; i++)); do
-        PREFILL_ARGS+=" --prefill http://${IP_ARRAY[$i]}:3000"
-    done
-    for ((i=xP; i<xP+yD && i<${#IP_ARRAY[@]}; i++)); do
-        DECODE_ARGS+=" --decode http://${IP_ARRAY[$i]}:3000"
-    done
-fi
-
-echo "PREFILL_ARGS: $PREFILL_ARGS"
-echo "DECODE_ARGS: $DECODE_ARGS"
-
 
 # =============================================================================
 # Container Synchronization
@@ -436,21 +215,17 @@ python $MOONCAKE_COOKBOOK_PATH/socket_barrier.py \
 
 
 # =============================================================================
-# Prepared sglang launch commands
+# Launching the servers and the router
 # =============================================================================
-# NODE_RANK 0        : first prefill node + router/proxy (co-located); supports xP>=1, yD>=1 for both DP_MODE=0 and DP_MODE=1.
-# NODE_RANK 1..xP-1  : remaining prefill workers (PREFILL_NODE_RANK = NODE_RANK).
-# NODE_RANK xP..xP+yD-1: decode workers (DECODE_NODE_RANK = NODE_RANK - xP).
-# NODE_RANK 0 (DP_MODE=0): waits for all worker logs; (DP_MODE=1): waits for master prefill (NODE 0) + master decode (NODE xP) only.
-# Workers sync on MASTER_ADDR:2322 and wait for proxy shutdown.
+# The router's node (NODE_RANK 0, co-located with the first prefill server, or the
+# router node) waits for the servers' logs: every server with DP_MODE=0, each role's
+# first node with DP_MODE=1. Servers sync on the router's :2322 and stop when it closes.
 
 cd /sgl-workspace/sglang || {
     echo "ERROR: cd /sgl-workspace/sglang failed"
     exit 1
 }
 fi
-
-unset PREFILL_CMD DECODE_CMD ROUTER_CMD 2>/dev/null || true
 
 setup_sglang_worker_env() {
     export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${IFNAME:-eth0}}"
@@ -493,29 +268,11 @@ _wait_for_tcp() {
     done
 }
 
-# This node's part of the run: from the topology spec when the launcher passed it
-# (MAD_TOPO_*, scripts/common/topology/topology.py), else from NODE_RANK, xP and yD as
-# before -- ranks 0..xP-1 prefill (0 also hosts the router), xP..xP+yD-1 decode, and
-# a router node after them when the launcher gave it one (ROUTER_ADDR).
-if [[ -n "${MAD_TOPO_ROLE:-}" ]]; then
-    _ROLE="$MAD_TOPO_ROLE"; _ROLE_INDEX="$MAD_TOPO_ROLE_INDEX"
-elif [[ "$NODE_RANK" -lt "$xP" ]]; then
-    _ROLE=prefill; _ROLE_INDEX="$NODE_RANK"
-elif [[ "$NODE_RANK" -le $((xP + yD - 1)) ]]; then
-    _ROLE=decode; _ROLE_INDEX=$((NODE_RANK - xP))
-elif [[ "$NODE_RANK" -eq $((xP + yD)) && "$ROUTER_ADDR" != "$MASTER_ADDR" ]]; then
-    _ROLE=router; _ROLE_INDEX=0
-else
-    _ROLE=""; _ROLE_INDEX=""
-fi
+# This node's part of the run, from render.py: ranks 0..xP-1 prefill (0 also hosts
+# the router), xP..xP+yD-1 decode, and a router node after them with ROUTER_NODE=1.
+_ROLE="$ROLE"; _ROLE_INDEX="$ROLE_INDEX"
 # Whether this node runs the router and the benchmark client.
-if [[ -n "${MAD_TOPO_ROUTER:-}" ]]; then
-    _HOSTS_ROUTER="$MAD_TOPO_ROUTER"
-elif [[ "$_ROLE" == router ]] || [[ "$_ROLE" == prefill && "$_ROLE_INDEX" -eq 0 && "$ROUTER_ADDR" == "$MASTER_ADDR" ]]; then
-    _HOSTS_ROUTER=1
-else
-    _HOSTS_ROUTER=0
-fi
+_HOSTS_ROUTER="$RUNS_ROUTER"
 
 if [[ "$_HOSTS_ROUTER" == 1 ]]; then
     if [[ "$_ROLE" == prefill ]]; then
@@ -531,54 +288,20 @@ if [[ "$_HOSTS_ROUTER" == 1 ]]; then
     if [[ "$_ROLE" == prefill ]]; then
         # --- Launch first prefill server on this node (co-located with router) ---
         setup_sglang_worker_env
-        PREFILL_NODE_RANK=0
-
-        # DP_MODE=1 with dp-size>1: router must use follow_bootstrap_room so each
-        # request is pinned to the DP rank that owns its bootstrap slot, preventing
-        # KV-transfer rank mismatches that cause requests to hang indefinitely.
-        _prefill_lb_method="round_robin"
-        [[ "$DP_MODE" == "1" ]] && _prefill_lb_method="follow_bootstrap_room"
-
-        _prefill_cmd="python3 -m sglang.launch_server \
-            --model-path ${MODEL_PATH} \
-            --disaggregation-mode prefill \
-            --load-balance-method ${_prefill_lb_method} \
-            ${_SGL_PRR_FLAG} \
-            --disaggregation-ib-device ${IB_DEVICES} \
-            --host ${host_ip} \
-            --port 3000 \
-            --trust-remote-code \
-            --tp-size ${PREFILL_TP_SIZE}"
-
-        if [[ "$DP_MODE" == "1" ]]; then
-            _prefill_cmd+=" \
-                --dp-size ${PREFILL_DP_SIZE} \
-                --ep-size ${PREFILL_EP_SIZE} \
-                --dist-init-addr ${PREFILL_DIST_INIT_ADDR} \
-                --nnodes ${PREFILL_NNODES} \
-                --node-rank ${PREFILL_NODE_RANK}"
-        fi
-
-        _prefill_cmd+=" \
-            --decode-log-interval 1 \
-            ${PREFILL_MODEL_CONFIG} \
-            ${SERVER_METRICS_FLAGS} \
-            --log-level-http warning"
-
-        export _prefill_cmd PREFILL_NODE_RANK
+        _server_cmd=(python3 -m sglang.launch_server "${SERVER_ARGV[@]}")
 
         if _dry_run; then
-            _dry_run_emit prefill "$_prefill_cmd"
+            _dry_run_emit prefill "${_server_cmd[@]}"
         else
             PREFILL_LOG="/run_logs/${SLURM_JOB_ID:-0}/prefill_NODE${NODE_RANK}.log"
             {
-                echo "========== PREFILL_CMD (NODE_RANK=0, PREFILL_NODE_RANK=0, co-located with router) =========="
-                echo "$_prefill_cmd"
+                echo "========== PREFILL_CMD (NODE_RANK=0, co-located with router) =========="
+                printf '%q ' "${_server_cmd[@]}"; echo
                 echo ""
             } | tee "$PREFILL_LOG"
-            _dbg "launching prefill server (PREFILL_NODE_RANK=0, PREFILL_TP_SIZE=${PREFILL_TP_SIZE})"
+            _dbg "launching prefill server (TP_SIZE=${TP_SIZE})"
             set -x
-            eval "$_prefill_cmd" 2>&1 | tee -a "$PREFILL_LOG" >/dev/null &
+            "${_server_cmd[@]}" 2>&1 | tee -a "$PREFILL_LOG" >/dev/null &
             set +x
             _node0_prefill_pid=$!
             _dbg "prefill server started pid=${_node0_prefill_pid}"
@@ -659,26 +382,19 @@ if [[ "$_HOSTS_ROUTER" == 1 ]]; then
         echo "Prefill/decode backends report ready per logs; starting sglang_router (proxy)."
     fi
 
-    # Build and launch only after worker logs confirm servers are up (avoids the proxy probing backends too early).
-    # 0.0.0.0 so bench_serving (--host 127.0.0.1 in benchmark_xPyD.sh) can connect; binding only ${host_ip} rejects loopback.
-    # PREFILL_ARGS / DECODE_ARGS already contain --prefill/--decode for all xP/yD nodes.
-    # Use them for both DP_MODE=0 and DP_MODE=1 so xP>1 or yD>1 registers all backends.
-    ROUTER_CMD="python3 -m sglang_router.launch_router \
-        --pd-disaggregation \
-        ${PREFILL_ARGS} \
-        ${DECODE_ARGS} \
-        --host 0.0.0.0 \
-        --port 2322"
-    export ROUTER_CMD
+    # Launched only after worker logs confirm servers are up (avoids the proxy probing
+    # backends too early). ROUTER_ARGV registers every server's leader (render.py) and
+    # binds 0.0.0.0, so bench_serving (--host 127.0.0.1 in benchmark_xPyD.sh) can connect.
+    _router_cmd=(python3 -m sglang_router.launch_router "${ROUTER_ARGV[@]}")
 
     if _dry_run; then
-        _dry_run_emit router "$ROUTER_CMD"
+        _dry_run_emit router "${_router_cmd[@]}"
         exit 0
     fi
     echo "========== ROUTER_CMD (NODE_RANK=${NODE_RANK}, DP_MODE=${DP_MODE}) ==========" >&2
-    echo "$ROUTER_CMD"
+    printf '%q ' "${_router_cmd[@]}"; echo
     set -x
-    eval "$ROUTER_CMD" 2>&1 | tee "/run_logs/${SLURM_JOB_ID:-0}/proxy_NODE${NODE_RANK}.log" >/dev/null &
+    "${_router_cmd[@]}" 2>&1 | tee "/run_logs/${SLURM_JOB_ID:-0}/proxy_NODE${NODE_RANK}.log" >/dev/null &
     set +x
     proxy_pid=$!
     echo "Router (sglang_router) started pid=${proxy_pid} (DP_MODE=${DP_MODE})"
@@ -803,65 +519,26 @@ PY
 
 elif [[ "$_ROLE" == prefill ]]; then
     echo "${host_name}:${host_ip} is Prefill Node (Model: ${MODEL_NAME:-default})"
-    # NODE_RANK 0..xP-1 map directly to PREFILL_NODE_RANK 0..xP-1 (proxy co-located on NODE_RANK=0).
-    PREFILL_NODE_RANK="$_ROLE_INDEX"
     setup_sglang_worker_env
-    #if [[ "$DP_MODE" == "0" ]]; then
-    #    export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${MORI_MAX_DISPATCH_TOKENS_PREFILL}"
-    #    echo "DP_MODE=0 prefill SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK=${SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK}"
-    #fi
+    _server_cmd=(python3 -m sglang.launch_server "${SERVER_ARGV[@]}")
 
-    _prefill_lb_method="round_robin"
-    [[ "$DP_MODE" == "1" ]] && _prefill_lb_method="follow_bootstrap_room"
-
-    PREFILL_CMD="python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode prefill \
-        --load-balance-method ${_prefill_lb_method} \
-        ${_SGL_PRR_FLAG} \
-        --disaggregation-ib-device ${IB_DEVICES} \
-        --host ${host_ip} \
-        --port 3000 \
-        --trust-remote-code \
-        --tp-size ${PREFILL_TP_SIZE}"
-
-    if [[ "$DP_MODE" == "1" ]]; then
-        PREFILL_CMD+=" \
-            --dp-size ${PREFILL_DP_SIZE} \
-            --ep-size ${PREFILL_EP_SIZE} \
-            --dist-init-addr ${PREFILL_DIST_INIT_ADDR} \
-            --nnodes ${PREFILL_NNODES} \
-            --node-rank ${PREFILL_NODE_RANK}"
-    fi
-   
-    PREFILL_CMD+=" \
-        --decode-log-interval 1 \
-        ${PREFILL_MODEL_CONFIG} \
-        ${SERVER_METRICS_FLAGS} \
-        --log-level-http warning"
-
-    export PREFILL_CMD PREFILL_NODE_RANK
-
-    # NOTE: do NOT gate PREFILL_NODE_RANK>=1 on port 5757 being open.
-    # Same rendezvous deadlock as decode: all prefill nodes must launch concurrently.
-    if [[ "$DP_MODE" == "1" ]] && (( PREFILL_NODE_RANK >= 1 )); then
-        _dbg "PREFILL_NODE_RANK=${PREFILL_NODE_RANK}: launching without gating on dist-init port (rendezvous requires all ranks concurrent)"
-    fi
+    # NOTE: do NOT gate a dp_ep server's later nodes on port 5757 being open.
+    # Same rendezvous deadlock as decode: all of a server's nodes must launch concurrently.
 
     if _dry_run; then
-        _dry_run_emit prefill "$PREFILL_CMD"
+        _dry_run_emit prefill "${_server_cmd[@]}"
         exit 0
     fi
     PREFILL_LOG="/run_logs/${SLURM_JOB_ID:-0}/prefill_NODE${NODE_RANK}.log"
     mkdir -p "$(dirname "$PREFILL_LOG")"
     {
-        echo "========== PREFILL_CMD (NODE_RANK=${NODE_RANK}, PREFILL_NODE_RANK=${PREFILL_NODE_RANK}) =========="
-        echo "$PREFILL_CMD"
+        echo "========== PREFILL_CMD (NODE_RANK=${NODE_RANK}, prefill ${_ROLE_INDEX}) =========="
+        printf '%q ' "${_server_cmd[@]}"; echo
         echo ""
     } | tee "$PREFILL_LOG"
-    _dbg "launching prefill server (PREFILL_NODE_RANK=${PREFILL_NODE_RANK}, PREFILL_TP_SIZE=${PREFILL_TP_SIZE})"
+    _dbg "launching prefill server (prefill ${_ROLE_INDEX}, TP_SIZE=${TP_SIZE})"
     set -x
-    eval "$PREFILL_CMD" 2>&1 | tee -a "$PREFILL_LOG" >/dev/null &
+    "${_server_cmd[@]}" 2>&1 | tee -a "$PREFILL_LOG" >/dev/null &
     set +x
     prefill_pid=$!
     _dbg "prefill server started pid=${prefill_pid}"
@@ -885,10 +562,8 @@ elif [[ "$_ROLE" == prefill ]]; then
 
 elif [[ "$_ROLE" == decode ]]; then
     echo "${host_name}:${host_ip} is Decode Node (Model: ${MODEL_NAME:-default})"
-    DECODE_NODE_RANK="$_ROLE_INDEX"
     setup_sglang_worker_env
-    _dbg "decode node: DECODE_NODE_RANK=${DECODE_NODE_RANK} DECODE_TP_SIZE=${DECODE_TP_SIZE} DECODE_DP_SIZE=${DECODE_DP_SIZE:-n/a} DECODE_EP_SIZE=${DECODE_EP_SIZE:-n/a}"
-    _dbg "DECODE_DIST_INIT_ADDR=${DECODE_DIST_INIT_ADDR} DECODE_NNODES=${DECODE_NNODES}"
+    _dbg "decode node: decode ${_ROLE_INDEX} TP_SIZE=${TP_SIZE}"
 
     if [[ "$DP_MODE" == "1" ]]; then
         #export SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK="${MORI_MAX_DISPATCH_TOKENS_PREFILL}"
@@ -903,54 +578,25 @@ elif [[ "$_ROLE" == decode ]]; then
         # torch init_process_group uses a rendezvous: rank 0 opens the port only
         # AFTER all ranks have joined. Waiting for rank 0's port before launching
         # rank 1 creates a permanent deadlock. All decode nodes must launch concurrently.
-        _dbg "DECODE_NODE_RANK=${DECODE_NODE_RANK}: launching without gating on dist-init port (rendezvous requires all ranks concurrent)"
+        _dbg "decode ${_ROLE_INDEX}: launching without gating on dist-init port (rendezvous requires all ranks concurrent)"
     fi
 
-    _decode_lb_method="round_robin"
-    [[ "$DP_MODE" == "1" ]] && _decode_lb_method="follow_bootstrap_room"
-
-    DECODE_CMD="python3 -m sglang.launch_server \
-        --model-path ${MODEL_PATH} \
-        --disaggregation-mode decode \
-        --load-balance-method ${_decode_lb_method} \
-        ${_SGL_PRR_FLAG} \
-        --disaggregation-ib-device ${IB_DEVICES} \
-        --host ${host_ip} \
-        --port 3000 \
-        --trust-remote-code \
-        --tp-size ${DECODE_TP_SIZE}"
-
-    if [[ "$DP_MODE" == "1" ]]; then
-        DECODE_CMD+=" \
-            --dp-size ${DECODE_DP_SIZE} \
-            --ep-size ${DECODE_EP_SIZE} \
-            --dist-init-addr ${DECODE_DIST_INIT_ADDR} \
-            --nnodes ${DECODE_NNODES} \
-            --node-rank ${DECODE_NODE_RANK}"
-    fi
-
-    DECODE_CMD+=" \
-        --decode-log-interval 1 \
-        ${DECODE_MODEL_CONFIG} \
-        ${SERVER_METRICS_FLAGS} \
-        --log-level-http warning"
-
-    export DECODE_CMD DECODE_NODE_RANK
+    _server_cmd=(python3 -m sglang.launch_server "${SERVER_ARGV[@]}")
 
     if _dry_run; then
-        _dry_run_emit decode "$DECODE_CMD"
+        _dry_run_emit decode "${_server_cmd[@]}"
         exit 0
     fi
     DECODE_LOG="/run_logs/${SLURM_JOB_ID:-0}/decode_NODE${NODE_RANK}.log"
     mkdir -p "$(dirname "$DECODE_LOG")"
     {
-        echo "========== DECODE_CMD (NODE_RANK=${NODE_RANK}, DECODE_NODE_RANK=${DECODE_NODE_RANK}) =========="
-        echo "$DECODE_CMD"
+        echo "========== DECODE_CMD (NODE_RANK=${NODE_RANK}, decode ${_ROLE_INDEX}) =========="
+        printf '%q ' "${_server_cmd[@]}"; echo
         echo ""
     } | tee "$DECODE_LOG"
-    _dbg "launching decode server (DECODE_NODE_RANK=${DECODE_NODE_RANK}, DECODE_TP_SIZE=${DECODE_TP_SIZE})"
+    _dbg "launching decode server (decode ${_ROLE_INDEX}, TP_SIZE=${TP_SIZE})"
     set -x
-    eval "$DECODE_CMD" 2>&1 | tee -a "$DECODE_LOG" >/dev/null &
+    "${_server_cmd[@]}" 2>&1 | tee -a "$DECODE_LOG" >/dev/null &
     set +x
     decode_pid=$!
     _dbg "decode server started pid=${decode_pid}"

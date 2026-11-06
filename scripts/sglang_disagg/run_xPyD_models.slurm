@@ -26,60 +26,6 @@ echo "PST Time: $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "======================="
 echo ""
 
-# -----------------------------------------------------------------------------
-# DP_MODE=1 allowlist — must match MORI_DP_MODE1_ALLOWED_MODELS in sglang_disagg_mori_io_ep.sh
-# -----------------------------------------------------------------------------
-MORI_DP_MODE1_ALLOWED_MODELS=(
-    "DeepSeek-V3"
-    "DeepSeek-R1"
-)
-
-mori_model_allows_dp_mode_one() {
-    local name="$1"
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        [[ "$name" == "$m" ]] && return 0
-    done
-    return 1
-}
-
-mori_dp_mode1_allowed_models_lines() {
-    local m
-    for m in "${MORI_DP_MODE1_ALLOWED_MODELS[@]}"; do
-        printf '  - %s\n' "$m"
-    done
-}
-
-# MoRI IO EP (`sglang_disagg_mori_io_ep.sh`): most models use DP_MODE=0 (tp only).
-MORI_EP_VALID_MODELS=( \
-    "Qwen3-32B" \
-    "Mixtral-8x7B-Instruct-v0.1" \
-    "Llama-3.1-8B-Instruct" \
-    "Llama-3.1-405B-Instruct-FP8-KV" \
-    "amd-Llama-3.3-70B-Instruct-FP8-KV" \
-    "DeepSeek-V3" \
-    "DeepSeek-R1" \
-)
-
-# Define valid model names
-VALID_MODELS=( \
-    "Qwen3-32B" \
-    "Mixtral-8x7B-Instruct-v0.1" \
-    "Llama-3.1-8B-Instruct" \
-    "Llama-3.1-405B-Instruct-FP8-KV" \
-    "amd-Llama-3.3-70B-Instruct-FP8-KV" \
-    "DeepSeek-V3" \
-    "DeepSeek-R1" \
-)
-
-model_allows_mori_ep() {
-    local m="$1"
-    for x in "${MORI_EP_VALID_MODELS[@]}"; do
-        [[ "$m" == "$x" ]] && return 0
-    done
-    return 1
-}
-
 # ---------------------------------------------------------------------------
 # Run file: always use sglang_disagg_mori_io_ep.sh (unified launcher).
 # RUN_MORI=0: sets KV_TRANSFER_BACKEND=mooncake (Mooncake).
@@ -207,29 +153,14 @@ done
 export SGLANG_FABRIC_ENV_ARGS
 echo "[fabric] ${CLUSTER_ARCHETYPE:-unknown}; forwarded to the container:${SGLANG_FABRIC_ENV_ARGS:- none (container defaults)}"
 
-validate_model_name() {
-  local is_valid_model=false
-
-  for model in "${VALID_MODELS[@]}"; do
-    if [[ "$MODEL_NAME" == "$model" ]]; then
-      is_valid_model=true
-      break
-    fi
-  done
-
-  if ! $is_valid_model; then
-    printf "Error: Invalid MODEL_NAME: '%s'\nValid models are:\n" "$MODEL_NAME"
-    for model in "${VALID_MODELS[@]}"; do
-      printf "  - %s\n" "$model"
-    done
-    exit 1
-  fi
-
-  echo "MODEL_NAME '$MODEL_NAME' is valid."
-  return 0
-}
-
-validate_model_name "${MODEL_NAME}"
+# The model, its parallel mode, the KV backend and the node counts, against models.yaml
+# (render.py), before any node is touched. Needs PyYAML on this host; without it the
+# container makes the same check before any server starts.
+if python3 -c 'import yaml' 2>/dev/null; then
+    MODEL_NAME="${MODEL_NAME:-}" xP="$xP" yD="$yD" DP_MODE="$DP_MODE" ROUTER_NODE="${ROUTER_NODE:-0}" \
+        python3 "${SCRIPT_DIR}/render.py" --models "${MODELS_YAML:-${SCRIPT_DIR}/models.yaml}" validate || exit 1
+    echo "MODEL_NAME '$MODEL_NAME' is valid (models.yaml)."
+fi
 
 # ------------------------
 # Model path validation and selection across all nodes
@@ -251,7 +182,7 @@ echo "Nodes: $(echo "$ALL_NODES" | tr '\n' ' ')"
 # ------------------------
 # mori_ep_env.sh selects the 8x CX7 400G rail NICs when USE_CX7_NICS=1, and those
 # require same-rail nodes; a cross-rail pair makes NCCL time out inside
-# ibv_modify_qp. base_flags carries --watchdog-timeout 1000000, so that timeout is a
+# ibv_modify_qp. The recipes carry --watchdog-timeout 1000000, so that timeout is a
 # hang, not a failure: the job would sit burning its allocation to the time limit.
 # Detect it in seconds instead, before any container starts.
 #
