@@ -75,7 +75,7 @@ set's base image for that architecture:
 
 MoRI before v1.2.2 registers GPU memory with `ibv_reg_mr` only, which fails (`errno 22`) on nodes
 without a GPU peer-memory module, for example MI355X with AMD AINIC NICs. v1.2.3 falls back to
-dma-buf. The launchers adapt the recipes' flags to sglang 0.5.20 (`sglang_compat.sh`).
+dma-buf. `render.py` adapts the recipes' flags to sglang 0.5.20 (`compat` in `models.yaml`).
 
 By hand, from the repository root:
 
@@ -100,7 +100,8 @@ through `DOCKER_IMAGE_NAME` still works, but a MAD-built image does no work at s
 | `run_xPyD_models.slurm` | SLURM batch script. Validates the model, picks nodes, resolves the weights, and runs `node.sh` on every node through the dispatcher (`scripts/common/dispatch/dispatch.sh`). |
 | `node.sh` | The per-node program: mounts, the topology for its rank, and this node's `docker run`. Shared parts are in `scripts/common/node/node_lib.sh`. |
 | `sglang_disagg_mori_io_ep.sh` | Container entrypoint. Starts the prefill and decode servers, the router (proxy), and the benchmark. |
-| `models.yaml` | Model-specific SGLang CLI flags for all supported models. |
+| `models.yaml` | SGLang server flags for every supported model, layered: defaults, models, KV backends, overlays, and `compat` for flags SGLang renamed or removed. |
+| `render.py` | Builds each node's server and router commands from `models.yaml`. `plan` previews every node of a run without GPUs; `check` reports any flag an image's SGLang does not accept. |
 | `mori_ep_env.sh` | RDMA, NCCL, Gloo and MoRI environment variables. Sourced by the entrypoint. |
 | `connectors/mori.env` | The constant defaults `mori_ep_env.sh` applies (NCCL tuning, MoRI QPs, timeouts, runtime switches), one `KEY=VALUE` per line. |
 | `benchmark_xPyD.sh` | Concurrency sweep using `sglang.bench_serving`. |
@@ -175,8 +176,9 @@ script's model list, so those two lines are rejected.
    starts the node's container with `docker run --network host --ipc host --privileged`, the GPU
    and InfiniBand devices, a 64 GB `/dev/shm`, the logs at `/run_logs`, this directory at
    `/opt/mooncake-cookbook`, and its part of the topology as `MAD_TOPO_*`.
-7. In each container, `sglang_disagg_mori_io_ep.sh` reads `models.yaml`, sources `mori_ep_env.sh`,
-   waits at a container barrier, and starts its role.
+7. In each container, `sglang_disagg_mori_io_ep.sh` sources `mori_ep_env.sh`, takes its role and its
+   server and router commands from `render.py` (the role as `MAD_TOPO_*` gives it), waits
+   at a container barrier, and starts its role.
 
 | `NODE_RANK` | Role |
 |---|---|
@@ -217,9 +219,10 @@ passed still reach madengine. Under a per-node dispatch, node 0 makes this verdi
 
 ### KV cache transfer backend
 
-The launcher selects the disaggregation KV-cache transfer backend
-(`--disaggregation-transfer-backend`) from `RUN_MORI`. The backend is kept out of `models.yaml` so
-the model recipes stay backend-agnostic. It applies to all supported models.
+The launcher selects the disaggregation KV-cache transfer backend from `RUN_MORI`
+(`KV_TRANSFER_BACKEND`). Its flag, `--disaggregation-transfer-backend`, comes from the `backends`
+section of `models.yaml`, so the model entries stay backend-agnostic. It applies to all supported
+models.
 
 | `RUN_MORI` | `KV_TRANSFER_BACKEND` | Backend | Status |
 |---|---|---|---|
@@ -228,87 +231,99 @@ the model recipes stay backend-agnostic. It applies to all supported models.
 
 ### Wide EP / large EP parallelism mode (`DP_MODE`)
 
-`PARALLEL_MODE` is derived strictly from `DP_MODE`, which selects the flag set from `models.yaml`.
+`DP_MODE` selects the mode `render.py` renders from `models.yaml` (named as in the topology spec):
 
-| `DP_MODE` | `PARALLEL_MODE` | Flags applied | Supported models |
+| `DP_MODE` | Mode | Flags applied | Supported models |
 |---|---|---|---|
-| `0` (default) | `tp` | `base_flags` + `tp_flags` + `prefill.tp` / `decode.tp` | All models |
-| `1` | `dp` | `base_flags` + `dp_flags` (`--moe-a2a-backend mori`, DP attention) + `prefill.dp` / `decode.dp` | DeepSeek-V3, DeepSeek-R1 only |
+| `0` (default) | `tp` | `defaults` and the model, their `tp` blocks | All models |
+| `1` | `dp_ep` | `defaults` and the model, their `dp_ep` blocks (`--moe-a2a-backend mori`, DP attention) | Models with a `modes.dp_ep` block: DeepSeek-V3, DeepSeek-R1 |
 
 - `DP_MODE=1` enables MoRI expert parallelism (EP) with DP attention, and requires `RUN_MORI=1`
   (MoRI IO).
-- It is restricted by an allowlist, `MORI_DP_MODE1_ALLOWED_MODELS`, enforced in both
-  `run_xPyD_models.slurm` and `sglang_disagg_mori_io_ep.sh`. Any other model with `DP_MODE=1` exits
-  with an error. Use `DP_MODE=0` (TP) for all non-DeepSeek models.
+- A model whose entry has no `modes.dp_ep` block is refused with `DP_MODE=1` by
+  `render.py validate`, in `run_xPyD_models.slurm` (when the host has PyYAML) and again in the
+  container. Use `DP_MODE=0` (TP) for all non-DeepSeek models.
 
-Parallel sizes the launcher passes (not the recipe):
+Parallel sizes `render.py` sets from the topology (not the recipe):
 
 | | `DP_MODE=0` | `DP_MODE=1` |
 |---|---|---|
-| `--tp-size` | `GENERIC_TP_SIZE` (default 8) on every server | `xP * GPUS_PER_NODE` for prefill, `yD * GPUS_PER_NODE` for decode |
+| `--tp-size` | `GENERIC_TP_SIZE` (default `GPUS_PER_NODE`) on every server | `xP * GPUS_PER_NODE` for prefill, `yD * GPUS_PER_NODE` for decode |
 | `--dp-size`, `--ep-size` | not passed | same as `--tp-size` per role |
-| `--dist-init-addr`, `--nnodes`, `--node-rank` | not passed | first prefill (or first decode) IP, port `DIST_INIT_PORT` (5757) |
+| `--dist-init-addr`, `--nnodes`, `--node-rank` | only for a server across nodes (`GENERIC_TP_SIZE` above `GPUS_PER_NODE`) | first prefill (or first decode) IP, port `DIST_INIT_PORT` (5757) |
 
-With `DP_MODE=0` and `xP>1` or `yD>1`, each node runs an independent TP server, and the router
-registers all of them.
+With `DP_MODE=0` each server spans `GENERIC_TP_SIZE / GPUS_PER_NODE` nodes (one, by default), so
+with `xP>1` or `yD>1` there are several servers per role, and the router registers each server's
+first node.
 
 ## Recipes (`models.yaml`)
 
-[`models.yaml`](../scripts/sglang_disagg/models.yaml) holds the SGLang CLI flags per model. It is
-loaded when `MODEL_NAME` is set.
+[`models.yaml`](../scripts/sglang_disagg/models.yaml) holds the SGLang server flags per model, as
+`--flag: value` maps. [`render.py`](../scripts/sglang_disagg/render.py) turns it into each node's
+`sglang.launch_server` and `sglang_router.launch_router` arguments; the file's header is the
+reference.
 
-| Key | Meaning |
+| Section | Meaning |
 |---|---|
-| `base_flags` | Always applied, prefill and decode. |
-| `tp_flags` / `dp_flags` | Mode-level flags applied to both prefill and decode. Omit when empty. |
-| `prefill.<tp\|dp>`, `decode.<tp\|dp>` | Role and mode specific flags. |
-| `experimental_flags` | Optional extra flags appended after the role and mode flags on both roles. For try-outs independent of the mode. Omit or `""` when unused. |
+| `defaults` | Flags for every model. |
+| `models.<MODEL_NAME>` | The model's entry. An empty entry (`{}`) takes the defaults. `extends: <model>` starts from another entry. |
+| `backends.<name>` | The KV transfer backend (`KV_TRANSFER_BACKEND`): its flag and the modes it is validated with. |
+| `overlays` | Switched on by run settings: `radix_cache` (agentic, or `ENABLE_RADIX_CACHE=1`) and `server_metrics` (agentic, or `ENABLE_SERVER_METRICS=1`). |
+| `compat` | Flags SGLang renamed or removed, applied only where the installed SGLang no longer accepts the name written in the recipe. |
 
-Do not set `--tp-size` or `--disaggregation-transfer-backend` here; the launcher manages them.
+`defaults` and each model entry are layered, later keys winning: `base` (every role and mode),
+`modes.<tp|dp_ep>`, `roles.<prefill|decode>` (every mode), `roles.<role>.<tp|dp_ep>`. Precedence,
+lowest first: `defaults`, the model, the backend, overlays, then `EXTRA_SERVER_ARGS`,
+`EXTRA_PREFILL_ARGS` and `EXTRA_DECODE_ARGS` (`EXTRA_ROUTER_ARGS` for the router). `true` is a bare
+flag, a list is several values, `"A..B"` is the integers A to B, and `false` or `null` removes a flag.
 
-The composed strings are:
+Do not set the flags `render.py` derives from the topology: `--model-path`, `--disaggregation-mode`,
+`--host`, `--port`, `--tp-size`, `--dp-size`, `--ep-size`, `--dist-init-addr`, `--nnodes`,
+`--node-rank`, `--disaggregation-ib-device`. A different recipe file can be used with
+`MODELS_YAML=<path>`.
 
+Preview every node's commands without a job, and check a recipe against an image:
+
+```bash
+cd scripts/sglang_disagg
+MODEL_NAME=DeepSeek-V3 DP_MODE=1 xP=1 yD=1 python3 render.py plan
+docker run --rm -w /tmp -v "$PWD:/r" <image> python3 /r/render.py check
 ```
-prefill: base_flags + <mode>_flags + prefill.<mode> + experimental_flags
-decode:  base_flags + <mode>_flags + decode.<mode>  + experimental_flags
-```
 
-A different recipe file can be used with `MODELS_YAML=<path>`.
-
-**Radix prefix cache.** Several `prefill` and `decode` blocks carry `--disable-radix-cache` for the
-default xPyD sweeps, which measure clean, cache-free throughput. The agentic replay needs the cache
-on, so the launcher strips `--disable-radix-cache` when `BENCHMARK_SCRIPT=agentic` or
-`ENABLE_RADIX_CACHE=1`. Only the agentic-tagged cards exercise that. Do not remove the flag from the
-recipes, or the sweeps lose their cache-free baseline.
+**Radix prefix cache.** The decode `tp` defaults (and the 405B prefill) carry
+`--disable-radix-cache` for the default xPyD sweeps, which measure clean, cache-free throughput.
+The agentic replay needs the cache on, so the `radix_cache` overlay removes the flag when
+`BENCHMARK_SCRIPT=agentic` or `ENABLE_RADIX_CACHE=1`. Only the agentic-tagged cards exercise that.
+Do not remove the flag from the recipes, or the sweeps lose their cache-free baseline.
 
 ### Every recipe
 
-All models share `base_flags` of the form
-`--attention-backend aiter --watchdog-timeout 1000000 --mem-fraction-static <f>`.
+Every model gets the defaults: `--trust-remote-code --attention-backend aiter --watchdog-timeout
+1000000 --mem-fraction-static 0.73 --prefill-round-robin-balance --decode-log-interval 1
+--log-level-http warning`, `--load-balance-method round_robin` in `tp` mode, and in `tp` mode
+`--disable-cuda-graph` on prefill and `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512`
+on decode. What the models change:
 
-| Model | `--mem-fraction-static` | `prefill.tp` | `decode.tp` |
-|---|---|---|---|
-| `Llama-3.1-8B-Instruct` | 0.73 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
-| `Qwen3-32B` | 0.73 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
-| `amd-Llama-3.3-70B-Instruct-FP8-KV` | 0.65 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
-| `Llama-3.1-405B-Instruct-FP8-KV` | 0.65 | `--disable-cuda-graph --disable-radix-cache` | `--disable-radix-cache --cuda-graph-bs $(seq 1 8)` |
-| `Mixtral-8x7B-Instruct-v0.1` | 0.73 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
-| `DeepSeek-V3` | 0.73 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
-| `DeepSeek-R1` | 0.73 | `--disable-cuda-graph` | `--disable-radix-cache --cuda-graph-bs 8 16 32 64 128 256 512` |
+| Model | Changes from the defaults |
+|---|---|
+| `Llama-3.1-8B-Instruct`, `Qwen3-32B`, `Mixtral-8x7B-Instruct-v0.1` | none |
+| `amd-Llama-3.3-70B-Instruct-FP8-KV` | `--mem-fraction-static 0.65` |
+| `Llama-3.1-405B-Instruct-FP8-KV` | `--mem-fraction-static 0.65`; prefill `tp`: `--disable-radix-cache`; decode `tp`: `--cuda-graph-bs 1..8` |
+| `DeepSeek-V3` | a `dp_ep` recipe, below |
+| `DeepSeek-R1` | extends `DeepSeek-V3`; prefill `dp_ep` keeps the default `--mem-fraction-static` |
 
-DeepSeek-V3 and DeepSeek-R1 also have `dp` recipes:
+DeepSeek-V3 and DeepSeek-R1 also run `DP_MODE=1` (mode `dp_ep`), which uses
+`--load-balance-method follow_bootstrap_room` from the defaults and:
 
 | Key | Value |
 |---|---|
-| `dp_flags` | `--moe-a2a-backend mori --enable-dp-attention --enable-dp-lm-head --moe-dense-tp-size 1 --enable-dp-attention-local-control-broadcast` |
-| `prefill.dp` (DeepSeek-V3) | `--max-running-requests 8192 --cuda-graph-bs $(seq 1 3) --mem-fraction-static 0.65` |
-| `prefill.dp` (DeepSeek-R1) | `--max-running-requests 8192 --cuda-graph-bs $(seq 1 3)` |
-| `decode.dp` | `--max-running-requests 8192 --cuda-graph-bs 1 2 4 8 16 24 32 48 64 96 128` |
+| `modes.dp_ep` | `--moe-a2a-backend mori --enable-dp-attention --enable-dp-lm-head --moe-dense-tp-size 1 --enable-dp-attention-local-control-broadcast --max-running-requests 8192` |
+| `roles.prefill.dp_ep` (DeepSeek-V3) | `--cuda-graph-bs 1..3 --mem-fraction-static 0.65` |
+| `roles.prefill.dp_ep` (DeepSeek-R1) | `--cuda-graph-bs 1..3` |
+| `roles.decode.dp_ep` | `--cuda-graph-bs 1 2 4 8 16 24 32 48 64 96 128` |
 
 `--enable-dp-attention-local-control-broadcast` is set on both roles. It forces all DP ranks to step
-together, so idle ranks enter the MoRI EP collective. Because prefill and decode use the same
-mode-level flags, they live in `dp_flags`; role-specific batch tuning is in `prefill.dp` and
-`decode.dp`.
+together, so idle ranks enter the MoRI EP collective.
 
 ## RDMA and NCCL environment
 
@@ -337,7 +352,7 @@ script forwards any of `NCCL_IB_HCA`, `NCCL_IB_GID_INDEX`, `NCCL_SOCKET_IFNAME`,
 node it also forwards what `cluster.sh` detected. Its `[fabric]` log line lists what it forwarded.
 
 **Same-rail check.** With `USE_CX7_NICS=1`, a cross-rail node pair makes NCCL time out inside
-`ibv_modify_qp`. Because `base_flags` carry `--watchdog-timeout 1000000`, that timeout is a hang,
+`ibv_modify_qp`. Because the recipes carry `--watchdog-timeout 1000000`, that timeout is a hang,
 not a failure. So before any container starts, the batch script reads SLURM's topology
 (`scontrol show topology`) and exits if the nodes span more than one leaf switch. The batch script
 header requests `--switches=2`. To avoid the failure: resubmit, set `--switches=1` to ask for one
@@ -425,8 +440,8 @@ them. It reads
 (4000), `ROUTER_POLL_SLEEP_SECONDS` (10), `SEARCH_SIGNAL`, `ROUTER_HTTP_BASE` and `CURL_TEST_MODEL`.
 These use their defaults unless the image or a forwarded name sets them.
 
-The recipes were tuned on sglang 0.5.12. Both launchers adapt their flags to the installed sglang
-(`sglang_compat.sh`), reading what it accepts from its own `--help`:
+The recipes were tuned on sglang 0.5.12 and are written in its flag names. `render.py` reads what
+the installed sglang accepts from its own `--help` and applies `compat` in `models.yaml`:
 
 - `--prefill-round-robin-balance` is passed only where it is accepted. Later releases removed it
   and refuse to start with it (0.5.20: `unrecognized arguments`).
@@ -434,8 +449,10 @@ The recipes were tuned on sglang 0.5.12. Both launchers adapt their flags to the
   `--cuda-graph-bs-prefill` (0.5.20: `ambiguous option`), is passed as `--cuda-graph-bs-decode`,
   the graphs it sized.
 
-If `--help` cannot be read, the flags pass unchanged. A server that rejects its command line is
-caught at once, not after `ROUTER_READY_TIMEOUT_SECONDS`.
+A further rename or removal is one line in `compat`. If `--help` cannot be read, the flags pass
+unchanged; `render.py check` run in an image reports any rendered flag that image's sglang does not
+accept. A server that rejects its command line is caught at once, not after
+`ROUTER_READY_TIMEOUT_SECONDS`.
 
 ## Model cards
 
