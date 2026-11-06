@@ -95,7 +95,8 @@ SPEC_LAUNCHER = {"vllm_disagg_2p2d_wide_ep_tp2.json": "vllm_dissag",
                  "sglang_disagg_1p2d_dp_ep.json": "sglang_disagg",
                  "vllm_colocated_2n_tp8_pp2.json": "vllm_multinode",
                  "vllm_disagg_2p2d_wide_ep_tp2_router_node.json": "vllm_dissag",
-                 "sglang_disagg_1p1d_tp8_router_node.json": "sglang_disagg"}
+                 "sglang_disagg_1p1d_tp8_router_node.json": "sglang_disagg",
+                 "sglang_disagg_2p2d_tp8.json": "sglang_disagg"}
 
 
 class SpecFile(unittest.TestCase):
