@@ -126,8 +126,8 @@ def engine_dry_run(catalog, docker, work):
     elif catalog == "sglang_disagg":
         script = scripts / "sglang_disagg" / "sglang_disagg_mori_io_ep.sh"
         env["MOONCAKE_COOKBOOK_PATH"] = str(scripts / "sglang_disagg")
-        # sglang_compat.sh adapts the recipe to the installed sglang's --help; empty
-        # help means "every option exists", i.e. the recipe as written, whether or not
+        # render.py adapts the recipe to the installed sglang's --help (models.yaml
+        # compat); empty help means "unknown", i.e. the recipe as written, whether or not
         # sglang is installed where this runs.
         env["_SGL_HELP"] = ""
     else:

@@ -72,7 +72,7 @@ sbatch -N 2 -n 2 --nodelist=<node1,node2> run_xPyD_models.slurm
 
 ### KV Cache Transfer Backend
 
-The unified launcher (`sglang_disagg_mori_io_ep.sh`) selects the disaggregation KV-cache transfer backend (`--disaggregation-transfer-backend`) via `RUN_MORI`. The backend is intentionally kept out of `models.yaml` so model configs stay backend-agnostic, and it applies to all supported models.
+`RUN_MORI` selects the disaggregation KV-cache transfer backend (`KV_TRANSFER_BACKEND`). Its flag (`--disaggregation-transfer-backend`) comes from the `backends` section of `models.yaml`, so the model entries stay backend-agnostic.
 
 | `RUN_MORI` | `KV_TRANSFER_BACKEND` | Backend | Status |
 |------------|-----------------------|---------|--------|
@@ -81,15 +81,16 @@ The unified launcher (`sglang_disagg_mori_io_ep.sh`) selects the disaggregation 
 
 ### WideEP/LargeEP Parallelism Mode (`DP_MODE`)
 
-`PARALLEL_MODE` is derived strictly from `DP_MODE`, which selects the flag set from `models.yaml`.
+`DP_MODE` selects the mode `render.py` renders from `models.yaml`:
 
-| `DP_MODE` | `PARALLEL_MODE` | Flags applied | Supported models |
-|-----------|-----------------|---------------|------------------|
-| `0` (default) | `tp` | `base_flags` + `tp_flags` + `prefill.tp` / `decode.tp` | All models |
-| `1` | `dp` | `base_flags` + `dp_flags` (`--moe-a2a-backend mori`, DP attention) + `prefill.dp` / `decode.dp` | DeepSeek-V3, DeepSeek-R1 only |
+| `DP_MODE` | Mode | Flags applied | Supported models |
+|-----------|------|---------------|------------------|
+| `0` (default) | `tp` | `defaults` and the model, their `tp` blocks | All models |
+| `1` | `dp_ep` | `defaults` and the model, their `dp_ep` blocks (`--moe-a2a-backend mori`, DP attention) | Models with a `modes.dp_ep` block: DeepSeek-V3, DeepSeek-R1 |
 
 - `DP_MODE=1` enables MoRI expert parallelism (EP) with DP attention and currently requires `RUN_MORI=1` (MoRI IO).
-- It is restricted by an allowlist (`MORI_DP_MODE1_ALLOWED_MODELS`) enforced in both `run_xPyD_models.slurm` and `sglang_disagg_mori_io_ep.sh`. Launching any other model with `DP_MODE=1` exits with an error — use `DP_MODE=0` (TP) for all non-DeepSeek models.
+- A model without a `modes.dp_ep` block is refused with `DP_MODE=1` (`render.py validate`, in `run_xPyD_models.slurm` and again in the container). Use `DP_MODE=0` (TP) for all non-DeepSeek models.
+- Preview every node's commands without a job: `MODEL_NAME=<model> xP=1 yD=1 python3 render.py plan`.
 
 ## Log Files
 
