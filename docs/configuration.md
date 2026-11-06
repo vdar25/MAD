@@ -127,7 +127,9 @@ There are two recipe files:
 - [`scripts/sglang_disagg/models.yaml`](../scripts/sglang_disagg/models.yaml): SGLang
   disaggregated.
 
-### Schema
+### Schema (vLLM)
+
+The SGLang recipe has a layered `--flag: value` format instead; see [SGLang recipes](#sglang-recipes).
 
 | Key | Applies to | Meaning |
 |---|---|---|
@@ -142,7 +144,6 @@ The mode is `PARALLEL_MODE`, which each launcher derives from one switch:
 | Launcher | Switch | `tp` mode | `dp` mode |
 |---|---|---|---|
 | vLLM disagg (`vllm_disagg.sh`) | `WIDE_EP` | `WIDE_EP=0` | `WIDE_EP=1` (wide expert parallel) |
-| SGLang disagg (`sglang_disagg_mori_io_ep.sh`) | `DP_MODE` | `DP_MODE=0` (default) | `DP_MODE=1` (MoRI EP with DP attention) |
 
 The composed flag string for a role is:
 
@@ -252,10 +253,17 @@ that endpoint returns 503 under MoRIIO service discovery.
 
 ### SGLang recipes
 
-The SGLang recipe has no `env:` block. SGLang's environment comes from
-[`mori_ep_env.sh`](../scripts/sglang_disagg/mori_ep_env.sh) inside the container. The SGLang
-`base_flags` carry `--disable-radix-cache` for clean throughput sweeps; the launcher strips it
-when `BENCHMARK_SCRIPT=agentic` or `ENABLE_RADIX_CACHE=1`. See
+The SGLang recipe holds `--flag: value` maps, which
+[`render.py`](../scripts/sglang_disagg/render.py) turns into each node's commands: `defaults` and
+per-model entries, each layered `base` -> `modes.<tp|dp_ep>` -> `roles.<prefill|decode>` ->
+`roles.<role>.<mode>`, then `backends` (KV transfer), `overlays` and `compat` (flags SGLang renamed
+or removed). `DP_MODE` selects the mode: `0` is `tp`, `1` is `dp_ep`. A model needs nothing but
+its entry. The file's header is the reference.
+
+It has no environment. SGLang's comes from
+[`mori_ep_env.sh`](../scripts/sglang_disagg/mori_ep_env.sh) inside the container. The decode
+defaults carry `--disable-radix-cache` for clean throughput sweeps; the `radix_cache` overlay
+removes it when `BENCHMARK_SCRIPT=agentic` or `ENABLE_RADIX_CACHE=1`. See
 [sglang-disagg.md](sglang-disagg.md#recipes-modelsyaml) for every SGLang recipe.
 
 ### Per-model ENV layering (vLLM disaggregated)
@@ -857,7 +865,7 @@ written as `<set>`.
 
 | I want to change | Where | Notes |
 |---|---|---|
-| A model's serve flags | `models.yaml`: `base_flags`, `<mode>_flags`, `<role>.<mode>`, `experimental_flags` | vLLM: `scripts/vllm_dissag/models.yaml`; SGLang: `scripts/sglang_disagg/models.yaml`; vLLM colocated: `COLOCATED_EXTRA_ARGS` in the card |
+| A model's serve flags | `models.yaml`. vLLM: `base_flags`, `<mode>_flags`, `<role>.<mode>`, `experimental_flags`; SGLang: the model's `--flag: value` entry | vLLM: `scripts/vllm_dissag/models.yaml`; SGLang: `scripts/sglang_disagg/models.yaml`; vLLM colocated: `COLOCATED_EXTRA_ARGS` in the card |
 | The name clients request | `--served-model-name` in the vLLM recipe flags | Resolved as `SERVED_MODEL_NAME` |
 | KV cache size | `KV_CACHE_MEMORY_BYTES` in the recipe `env:` | Also `GPU_MEMORY_UTILIZATION`; SGLang: `--mem-fraction-static` in the flags |
 | KV block size, KV dtype | `KV_BLOCK_SIZE`, `KV_CACHE_DTYPE` in the recipe `env:` | |

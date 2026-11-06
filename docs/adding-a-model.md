@@ -639,8 +639,10 @@ Keep the card small. Model-specific serve flags belong in the **recipe**, not in
 - vLLM disaggregated: an entry in [`scripts/vllm_dissag/models.yaml`](../scripts/vllm_dissag/models.yaml)
   keyed by `MODEL_NAME`, plus the name in `VALID_MODELS` in `run_xPyD_models.slurm`. See
   [vllm-disagg.md](vllm-disagg.md).
-- SGLang disaggregated: [`scripts/sglang_disagg/models.yaml`](../scripts/sglang_disagg/models.yaml).
-  See [sglang-disagg.md](sglang-disagg.md).
+- SGLang disaggregated: an entry in [`scripts/sglang_disagg/models.yaml`](../scripts/sglang_disagg/models.yaml),
+  a `--flag: value` map over the defaults (`{}` takes them as they are); nothing else lists the
+  model. `python3 scripts/sglang_disagg/render.py plan` previews every node's command. See
+  [sglang-disagg.md](sglang-disagg.md#recipes-modelsyaml).
 - vLLM colocated multinode: the card's `env_vars` (for example `TP_SIZE`, `PP_SIZE`,
   `COLOCATED_EXTRA_ARGS`) and [`scripts/vllm_multinode/mad-config.kimi-k3.yaml`](../scripts/vllm_multinode/mad-config.kimi-k3.yaml).
   See [kimi-k3.md](kimi-k3.md).

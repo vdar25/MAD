@@ -746,6 +746,8 @@ python3 -m unittest discover -s scripts/common/topology/tests -v
 python3 -m unittest discover -s scripts/common/config/tests -v
 python3 -m unittest discover -s scripts/common/k8s/tests -v
 python3 -m unittest discover -s docker/pins/tests -v           # the pin sets
+python3 -m unittest discover -s scripts/sglang_disagg/tests -v  # the SGLang recipe and render.py
+bash scripts/sglang_disagg/tests/prr_flag_assert.sh   # SGLang flag compat against fake 0.5.12 / 0.5.20 installs
 ```
 
 A change that alters what a node runs on purpose shows up as a snapshot difference:

@@ -329,17 +329,17 @@ The SGLang disagg launcher has its own two switches:
 | `1` (default) | `mori` | MoRI IO |
 | `0` | `mooncake` | Mooncake |
 
-The backend is passed to SGLang as `--disaggregation-transfer-backend`. It is kept out
-of `models.yaml` so model configs stay backend-agnostic.
+The backend is passed to SGLang as `--disaggregation-transfer-backend`, from the `backends`
+section of `models.yaml`, so the model entries stay backend-agnostic.
 
-| `DP_MODE` | `PARALLEL_MODE` | Flags applied | Models |
+| `DP_MODE` | Mode | Flags applied | Models |
 |---|---|---|---|
-| `0` (default) | `tp` | `base_flags` + `tp_flags` + `prefill.tp` / `decode.tp` | All |
-| `1` | `dp` | `base_flags` + `dp_flags` (`--moe-a2a-backend mori`, DP attention) + `prefill.dp` / `decode.dp` | DeepSeek-V3, DeepSeek-R1 only |
+| `0` (default) | `tp` | `defaults` and the model, their `tp` blocks | All |
+| `1` | `dp_ep` | `defaults` and the model, their `dp_ep` blocks (`--moe-a2a-backend mori`, DP attention) | DeepSeek-V3, DeepSeek-R1 only |
 
 `DP_MODE=1` enables MoRI expert parallelism with DP attention and requires
-`RUN_MORI=1`. An allowlist (`MORI_DP_MODE1_ALLOWED_MODELS`) enforces the model
-restriction. The SGLang cards are named after the combination: `mori_io` (MoRI IO,
+`RUN_MORI=1`. Only a model whose `models.yaml` entry has a `modes.dp_ep` block accepts it
+(`render.py validate`). The SGLang cards are named after the combination: `mori_io` (MoRI IO,
 TP), `mori_dp` (MoRI IO, DP_MODE=1) and `mooncake`. Details are in
 [sglang-disagg.md](sglang-disagg.md).
 

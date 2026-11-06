@@ -122,3 +122,4 @@ None of these need GPUs; run them from the MAD root. The full list is in
 | Site fabric | `bash scripts/common/tests/cluster_fabric_assert.sh` |
 | Kubernetes | `python3 -m unittest discover -s scripts/common/k8s/tests` |
 | Pin sets | `python3 docker/pins/pins.py validate`; `python3 -m unittest discover -s docker/pins/tests` |
+| SGLang recipe | `python3 -m unittest discover -s scripts/sglang_disagg/tests`; `bash scripts/sglang_disagg/tests/prr_flag_assert.sh` |
