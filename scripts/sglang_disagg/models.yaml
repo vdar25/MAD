@@ -135,3 +135,28 @@ models:
       prefill:
         dp_ep:
           --mem-fraction-static: null
+
+  DeepSeek-V4-Pro:
+    env:
+      # Under this many tokens AITER feeds the FP4 experts bf16 activations, for
+      # which gfx950 has no MoE kernel ("Unsupported kernel config for moe
+      # heuristic dispatch"); 0 keeps every batch on the tuned fp8 path.
+      AITER_BF16_FP8_MOE_BOUND: "0"
+      SGLANG_HACK_FLASHMLA_BACKEND: unified_kv_triton
+      TORCH_BLAS_PREFER_HIPBLASLT: "1"
+      SGLANG_OPT_USE_AITER_BATCHED_GEMM: "true"
+    base:
+      --attention-backend: dsv4
+      --enable-deepseek-v4-fp4-indexer: true
+      --enforce-shared-experts-fusion: true
+      --kv-cache-dtype: fp8_e4m3
+      --page-size: 256
+      --swa-full-tokens-ratio: 0.1
+      --chunked-prefill-size: 16384
+      --mem-fraction-static: 0.86
+      --max-running-requests: 256
+    roles:
+      decode:
+        tp:
+          # Graphs above --max-running-requests are never replayed.
+          --cuda-graph-bs: [1, 2, 4, 8, 16, 32, 64, 128, 256]
