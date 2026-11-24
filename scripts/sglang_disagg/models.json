@@ -287,6 +287,47 @@
         }
     },
     {
+        "name": "pyt_sglang_disagg_mori_io_deepseek-v4-pro",
+        "dockerfile": "../../docker/di_sglang",
+        "dockercontext": ".",
+        "docker_build_arg": {"PINS": "sglang-disagg"},
+        "scripts": "run_xPyD_models.slurm",
+        "url": "",
+        "data": "huggingface",
+        "n_gpus": "-1",
+        "owner": "mad.support@amd.com",
+        "training_precision": "",
+        "multiple_results": "perf_DeepSeek-V4-Pro.csv",
+        "tags": [
+            "pyt",
+            "sglang",
+            "sglang_disagg",
+            "mori_io",
+            "inference"
+        ],
+        "timeout": -1,
+        "distributed": {
+            "launcher": "slurm_multi",
+            "nnodes": 2
+        },
+        "env_vars": {
+            "DOCKER_IMAGE_NAME": "<supply-your-image>",
+            "MODEL_NAME": "DeepSeek-V4-Pro",
+            "xP": "1",
+            "yD": "1",
+            "DP_MODE": "0",
+            "RUN_MORI": "1",
+            "USE_CX7_NICS": "0",
+            "BENCHMARK_COMBINATIONS": "1024/1024"
+        },
+        "args": "-N 2 -n 2",
+        "slurm": {
+            "nodes": 2,
+            "gpus_per_node": 8,
+            "time": "24:00:00"
+        }
+    },
+    {
         "name": "pyt_sglang_disagg_mori_dp_deepseek-v3",
         "dockerfile": "../../docker/di_sglang",
         "dockercontext": ".",
@@ -641,6 +682,47 @@
         "env_vars": {
             "DOCKER_IMAGE_NAME": "<supply-your-image>",
             "MODEL_NAME": "DeepSeek-R1",
+            "xP": "1",
+            "yD": "1",
+            "DP_MODE": "0",
+            "RUN_MORI": "0",
+            "USE_CX7_NICS": "0",
+            "BENCHMARK_COMBINATIONS": "1024/1024"
+        },
+        "args": "-N 2 -n 2",
+        "slurm": {
+            "nodes": 2,
+            "gpus_per_node": 8,
+            "time": "24:00:00"
+        }
+    },
+    {
+        "name": "pyt_sglang_disagg_mooncake_deepseek-v4-pro",
+        "dockerfile": "../../docker/di_sglang",
+        "dockercontext": ".",
+        "docker_build_arg": {"PINS": "sglang-disagg"},
+        "scripts": "run_xPyD_models.slurm",
+        "url": "",
+        "data": "huggingface",
+        "n_gpus": "-1",
+        "owner": "mad.support@amd.com",
+        "training_precision": "",
+        "multiple_results": "perf_DeepSeek-V4-Pro.csv",
+        "tags": [
+            "pyt",
+            "sglang",
+            "sglang_disagg",
+            "mooncake",
+            "inference"
+        ],
+        "timeout": -1,
+        "distributed": {
+            "launcher": "slurm_multi",
+            "nnodes": 2
+        },
+        "env_vars": {
+            "DOCKER_IMAGE_NAME": "<supply-your-image>",
+            "MODEL_NAME": "DeepSeek-V4-Pro",
             "xP": "1",
             "yD": "1",
             "DP_MODE": "0",

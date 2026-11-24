@@ -24,6 +24,7 @@ MoE models:
 
 - DeepSeek-V3 (<https://huggingface.co/deepseek-ai/DeepSeek-V3>)
 - DeepSeek-R1 (<https://huggingface.co/deepseek-ai/DeepSeek-R1>)
+- DeepSeek-V4-Pro (<https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro>)
 - Mixtral-8x7B-v0.1 (<https://huggingface.co/mistralai/Mixtral-8x7B-v0.1>)
 
 `MODEL_NAME` must be one of these exact values. The batch script rejects any other name and lists
@@ -38,6 +39,7 @@ the valid ones:
 | `Mixtral-8x7B-Instruct-v0.1` | MoE | no |
 | `DeepSeek-V3` | MoE | yes |
 | `DeepSeek-R1` | MoE | yes |
+| `DeepSeek-V4-Pro` | MoE | no |
 
 `MODEL_NAME` is also the directory name the launcher looks for under the weight roots, unless
 `MODEL_WEIGHTS_NAME` says otherwise (see [Model weights](#model-weights)).
@@ -315,6 +317,7 @@ on decode. What the models change:
 | `Llama-3.1-405B-Instruct-FP8-KV` | `--mem-fraction-static 0.65`; prefill `tp`: `--disable-radix-cache`; decode `tp`: `--cuda-graph-bs 1..8` |
 | `DeepSeek-V3` | a `dp_ep` recipe, below |
 | `DeepSeek-R1` | extends `DeepSeek-V3`; prefill `dp_ep` keeps the default `--mem-fraction-static` |
+| `DeepSeek-V4-Pro` | `env`: `AITER_BF16_FP8_MOE_BOUND=0` (required on gfx950: below 256 tokens AITER otherwise sends the FP4 experts bf16 activations, which have no MoE kernel), `SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton`, `TORCH_BLAS_PREFER_HIPBLASLT=1`, `SGLANG_OPT_USE_AITER_BATCHED_GEMM=true`; flags `--attention-backend dsv4 --enable-deepseek-v4-fp4-indexer --enforce-shared-experts-fusion --kv-cache-dtype fp8_e4m3 --page-size 256 --swa-full-tokens-ratio 0.1 --chunked-prefill-size 16384 --mem-fraction-static 0.86 --max-running-requests 256`; decode `tp`: `--cuda-graph-bs 1 2 4 8 16 32 64 128 256` |
 
 DeepSeek-V3 and DeepSeek-R1 also run `DP_MODE=1` (mode `dp_ep`), which uses
 `--load-balance-method follow_bootstrap_room` from the defaults and:
@@ -475,6 +478,7 @@ Every card uses `docker/di_sglang` with pin set `sglang-disagg`, launcher `run_x
 | `pyt_sglang_disagg_mori_io_mixtral-8x7b` | `Mixtral-8x7B-Instruct-v0.1` | 1 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mori_io_deepseek-v3` | `DeepSeek-V3` | 1 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mori_io_deepseek-r1` | `DeepSeek-R1` | 1 | 0 | 0 | sweep 1024/1024 |
+| `pyt_sglang_disagg_mori_io_deepseek-v4-pro` | `DeepSeek-V4-Pro` | 1 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mori_dp_deepseek-v3` | `DeepSeek-V3` | 1 | 1 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mori_dp_deepseek-r1` | `DeepSeek-R1` | 1 | 1 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mooncake_llama-3.1-8b` | `Llama-3.1-8B-Instruct` | 0 | 0 | 1 | sweep 1024/1024 |
@@ -484,6 +488,7 @@ Every card uses `docker/di_sglang` with pin set `sglang-disagg`, launcher `run_x
 | `pyt_sglang_disagg_mooncake_mixtral-8x7b` | `Mixtral-8x7B-Instruct-v0.1` | 0 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mooncake_deepseek-v3` | `DeepSeek-V3` | 0 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mooncake_deepseek-r1` | `DeepSeek-R1` | 0 | 0 | 0 | sweep 1024/1024 |
+| `pyt_sglang_disagg_mooncake_deepseek-v4-pro` | `DeepSeek-V4-Pro` | 0 | 0 | 0 | sweep 1024/1024 |
 | `pyt_sglang_disagg_mori_io_agentic_qwen3-32b` | `Qwen3-32B` | 1 | 0 | 0 | agentic, `conformance_256k` |
 | `pyt_sglang_disagg_mori_dp_agentic_deepseek-v3` | `DeepSeek-V3` | 1 | 1 | 0 | agentic, `conformance_256k` |
 

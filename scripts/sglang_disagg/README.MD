@@ -9,6 +9,7 @@ Dense Models
 MoE Models
 - DeepSeek-V3 (https://huggingface.co/deepseek-ai/DeepSeek-V3)
 - DeepSeek-R1 (https://huggingface.co/deepseek-ai/DeepSeek-R1)
+- DeepSeek-V4-Pro (https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
 - Mixtral-8x7B-v0.1 (https://huggingface.co/mistralai/Mixtral-8x7B-v0.1)
 
 This repository contains scripts and documentation to launch PD Disaggregation for above models. You will find setup instructions, node assignment details and benchmarking commands.
